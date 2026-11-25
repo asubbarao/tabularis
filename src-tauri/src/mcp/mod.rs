@@ -30,6 +30,7 @@ mod output;
 pub mod preflight;
 pub mod protocol;
 mod termination;
+pub(crate) mod ui_requests;
 use cooldown::{DISABLE_CHECK_COOLDOWN, RELOAD_COOLDOWN};
 use database_scope::apply_database_override;
 use keychain::{read_stored_secret, StoredSecret};
@@ -789,6 +790,53 @@ fn handle_list_tools(config: &AppConfig) -> Result<Value, JsonRpcError> {
                 "required": ["connection_id", "query"]
             }),
         },
+        Tool {
+            name: "open_files".to_string(),
+            description: Some("Open UTF-8 working files as visible Tabularis tabs, including code, Terraform, SQL, Markdown, JSON, dotfiles, and custom extensions.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute paths to regular UTF-8 text files up to 50 MiB; any filename or extension is accepted"
+                    },
+                    "connection_id": {
+                        "type": "string",
+                        "description": "Configured connection ID from list_connections (optional; Tabularis switches to it before opening files)"
+                    },
+                    "reveal": {
+                        "type": "boolean",
+                        "description": "Show and focus the Tabularis window while opening files (default: false)"
+                    },
+                    "output_format": output_format_schema(default_output_format)
+                },
+                "required": ["paths"]
+            }),
+        },
+        Tool {
+            name: "list_visible_tabs".to_string(),
+            description: Some("List the tabs currently visible in the active Tabularis editor".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "output_format": output_format_schema(default_output_format)
+                }
+            }),
+        },
+        Tool {
+            name: "run_visible_tab".to_string(),
+            description: Some("Run the saved SQL file from its visible Tabularis editor tab and show the result there".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to an open .sql, .psql or .pgsql file"},
+                    "expected_sha256": {"type": "string", "description": "SHA-256 returned by open_files or list_visible_tabs"},
+                    "output_format": output_format_schema(default_output_format)
+                },
+                "required": ["path", "expected_sha256"]
+            }),
+        },
     ];
 
     Ok(json!({
@@ -924,6 +972,92 @@ async fn dispatch_tool(
             let args = require_args(args)?;
             let format = requested_output_format(Some(args), config)?;
             tool_run_query(args, config, session_id, audit, format).await
+        }
+        "open_files" => {
+            let args = require_args(args)?;
+            let values = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .ok_or(JsonRpcError {
+                    code: -32602,
+                    message: "Missing paths array".to_string(),
+                    data: None,
+                })?;
+            let paths = values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or(JsonRpcError {
+                        code: -32602,
+                        message: "Every path must be a string".to_string(),
+                        data: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let reveal = args
+                .get("reveal")
+                .map(|value| {
+                    value.as_bool().ok_or(JsonRpcError {
+                        code: -32602,
+                        message: "reveal must be a boolean".to_string(),
+                        data: None,
+                    })
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let format = requested_output_format(Some(args), config)?;
+            let connection_id = args
+                .get("connection_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let response = ui_requests::open_files(paths, connection_id, reveal)
+                .await
+                .map_err(|message| JsonRpcError {
+                    code: -32000,
+                    message,
+                    data: None,
+                })?;
+            tool_result(&response, format)
+        }
+        "list_visible_tabs" => {
+            let format = requested_output_format(args, config)?;
+            let response =
+                ui_requests::list_visible_tabs()
+                    .await
+                    .map_err(|message| JsonRpcError {
+                        code: -32000,
+                        message,
+                        data: None,
+                    })?;
+            tool_result(&response, format)
+        }
+        "run_visible_tab" => {
+            let args = require_args(args)?;
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or(JsonRpcError {
+                    code: -32602,
+                    message: "Missing SQL path".to_string(),
+                    data: None,
+                })?;
+            let expected_sha256 =
+                args.get("expected_sha256")
+                    .and_then(Value::as_str)
+                    .ok_or(JsonRpcError {
+                        code: -32602,
+                        message: "Missing expected_sha256".to_string(),
+                        data: None,
+                    })?;
+            let format = requested_output_format(Some(args), config)?;
+            let response =
+                ui_requests::run_visible_tab(path.to_string(), expected_sha256.to_string())
+                    .await
+                    .map_err(|message| JsonRpcError {
+                        code: -32000,
+                        message,
+                        data: None,
+                    })?;
+            tool_result(&response, format)
         }
         _ => Err(JsonRpcError {
             code: -32601,

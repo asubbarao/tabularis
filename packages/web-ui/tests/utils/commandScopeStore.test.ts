@@ -4,6 +4,7 @@ import type {CommandScope} from '@/types/commands';
 import {
     createCommandScopeStore,
     getActiveCommandScopeId,
+    isActiveCommandScope,
     ROOT_COMMAND_SCOPE_ID,
 } from '@/utils/commandScopeStore';
 
@@ -45,12 +46,13 @@ describe('createCommandScopeStore', () => {
 
 describe('getActiveCommandScopeId', () => {
     it('should use the active split pane when the split layout is rendered', () => {
-        expect(
-            getActiveCommandScopeId({
-                explorerConnectionId: 'connection-b',
-                isSplitRendered: true,
-            }),
-        ).toBe('connection-b');
+        const activeScopeId = getActiveCommandScopeId({
+            explorerConnectionId: 'connection-b',
+            isSplitRendered: true,
+        });
+
+        expect(isActiveCommandScope('connection-a', activeScopeId)).toBe(false);
+        expect(isActiveCommandScope('connection-b', activeScopeId)).toBe(true);
     });
 
     it('should use the root scope when the split layout is not rendered', () => {

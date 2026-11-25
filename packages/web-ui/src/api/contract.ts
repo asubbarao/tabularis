@@ -1310,6 +1310,13 @@ export interface CommandMap {
     /** Paths are host paths; browsers may only use server file browser roots. */
     read_sql_file: CommandDefinition<{path: string}, string, 'local-admin'>;
     write_sql_file: CommandDefinition<{path: string; content: string}, void, 'local-admin'>;
+    claim_mcp_ui_request: CommandDefinition<{id: string}, boolean, 'local-admin'>;
+    mcp_ui_ready: CommandDefinition<
+        {kind: 'open_files' | 'list_visible_tabs' | 'run_visible_tab'; ready: boolean},
+        void,
+        'local-admin'
+    >;
+    write_mcp_ui_response: CommandDefinition<{path: string; content: string}, void, 'local-admin'>;
 
     get_connection_metadata: CommandDefinition<
         ConnectionIdRequest,

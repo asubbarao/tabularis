@@ -21,6 +21,20 @@ export const toBindParamName = (name: string): string => {
 // a word character
 const PARAM_RE = /(?<![\w:]):([a-zA-Z_][a-zA-Z0-9_]*)(?!\w)/g;
 
+const isQuotedKeySeparator = (
+    sql: string,
+    colonIndex: number,
+    dialect?: DialectInput,
+): boolean => {
+    if (typeof dialect !== 'string' || dialect.toLowerCase() !== 'duckdb') return false;
+    let previous = colonIndex - 1;
+    while (previous >= 0 && sql[previous].trim() === '') previous--;
+    return (
+        previous >= 0 &&
+        ["'", '"', String.fromCharCode(96), ']'].includes(sql[previous])
+    );
+};
+
 /**
  * Returns `sql` with every string literal and comment replaced by spaces
  * so the parameter regex only ever sees executable SQL (issue #458). The
@@ -43,11 +57,14 @@ export const maskNonCode = (sql: string, dialect?: DialectInput): string => {
 
 export const extractQueryParams = (sql: string, dialect?: DialectInput): string[] => {
     if (!sql) return [];
-    const matches = maskNonCode(sql, dialect).match(PARAM_RE);
-    if (!matches) return [];
+    const masked = maskNonCode(sql, dialect);
+    const matches = Array.from(masked.matchAll(PARAM_RE)).filter(
+        (match) => !isQuotedKeySeparator(sql, match.index ?? 0, dialect),
+    );
+    if (matches.length === 0) return [];
 
     // Remove duplicate parameters and the leading colon
-    const uniqueParams = new Set(matches.map((m) => m.substring(1)));
+    const uniqueParams = new Set(matches.map((m) => m[1]));
     return Array.from(uniqueParams);
 };
 
@@ -68,6 +85,7 @@ export const interpolateQueryParams = (
     let result = '';
     let cursor = 0;
     for (const match of masked.matchAll(PARAM_RE)) {
+        if (isQuotedKeySeparator(sql, match.index ?? 0, dialect)) continue;
         // Own-property check: a plain `params[name]` lookup would resolve
         // names like :toString via Object.prototype and splice function
         // source into the SQL.

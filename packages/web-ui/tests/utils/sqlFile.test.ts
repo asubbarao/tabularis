@@ -1,6 +1,8 @@
 import {describe, expect, it} from 'vitest';
 import {
     createSqlFileTab,
+    getSourceFileKind,
+    getSourceFileLanguage,
     getSavedQueryExportFileName,
     getSqlFileName,
     hasUnsavedSqlFileTabs,
@@ -26,6 +28,7 @@ describe('sqlFile', () => {
                 type: 'console',
                 title: 'report.sql',
                 query: 'SELECT 1;',
+                sourceFileKind: 'sql',
                 sourceFilePath: '/tmp/report.sql',
                 sourceFileContent: 'SELECT 1;',
                 sourceFileDirty: false,
@@ -39,11 +42,28 @@ describe('sqlFile', () => {
                 type: 'console',
                 title: 'schema.psql',
                 query: 'CREATE TABLE users ();',
+                sourceFileKind: 'sql',
                 sourceFilePath: 'C:\\queries\\schema.psql',
                 sourceFileContent: 'CREATE TABLE users ();',
                 sourceFileDirty: false,
                 schema: 'analytics',
             });
+        });
+
+        it('keeps non-SQL files out of the run path and selects a text language', () => {
+            expect(createSqlFileTab('/work/main.tf', 'resource "x" "y" {}').readOnly).toBe(true);
+            expect(createSqlFileTab('/work/settings.json', '{}').readOnly).toBe(true);
+            expect(createSqlFileTab('/work/query.sql', 'SELECT 1').readOnly).toBeUndefined();
+            expect(getSourceFileLanguage('/work/main.tf')).toBe('plaintext');
+            expect(getSourceFileLanguage('/work/config.yaml')).toBe('yaml');
+            expect(getSourceFileLanguage('/work/README.md')).toBe('markdown');
+            expect(getSourceFileLanguage('/work/unknown.custom')).toBe('plaintext');
+            expect(getSourceFileKind('/work/main.tf')).toBe('text');
+            expect(getSourceFileKind('/work/README.md')).toBe('markdown');
+            expect(getSourceFileKind('/work/page.pdf')).toBe('text');
+            expect(getSourceFileKind('/work/chart.svg')).toBe('text');
+            expect(getSourceFileKind('/work/custom.filetype')).toBe('text');
+            expect(getSourceFileKind('/work/.gitignore')).toBe('text');
         });
     });
 

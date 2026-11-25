@@ -11,6 +11,73 @@ export function getSqlFileName(filePath: string): string {
  * sanitizes invalid and reserved characters across Windows, macOS, and Linux,
  * and preserves valid extensions (defaulting to .sql).
  */
+const SQL_EXTENSIONS = new Set(['sql', 'psql', 'pgsql']);
+
+const SOURCE_LANGUAGES: Record<string, string> = {
+    bash: 'shell',
+    c: 'c',
+    cc: 'cpp',
+    cpp: 'cpp',
+    cs: 'csharp',
+    css: 'css',
+    dockerfile: 'plaintext',
+    env: 'plaintext',
+    graphql: 'plaintext',
+    go: 'go',
+    h: 'c',
+    hcl: 'plaintext',
+    html: 'html',
+    java: 'java',
+    js: 'javascript',
+    json: 'json',
+    jsonc: 'json',
+    jsx: 'javascript',
+    kt: 'kotlin',
+    lua: 'lua',
+    md: 'markdown',
+    markdown: 'markdown',
+    mjs: 'javascript',
+    mts: 'typescript',
+    proto: 'plaintext',
+    properties: 'plaintext',
+    prisma: 'plaintext',
+    gql: 'plaintext',
+    csv: 'plaintext',
+    log: 'plaintext',
+    mdx: 'markdown',
+    php: 'php',
+    py: 'python',
+    rb: 'ruby',
+    rs: 'rust',
+    scss: 'scss',
+    sh: 'shell',
+    sql: 'sql',
+    swift: 'swift',
+    ts: 'typescript',
+    tsx: 'typescript',
+    txt: 'plaintext',
+    xml: 'xml',
+    yaml: 'yaml',
+    yml: 'yaml',
+};
+
+export function isSqlSourceFile(filePath: string): boolean {
+    const extension = filePath.split('.').pop()?.toLowerCase() ?? '';
+    return SQL_EXTENSIONS.has(extension);
+}
+
+export function getSourceFileKind(filePath: string): 'sql' | 'markdown' | 'text' {
+    const extension = filePath.split('.').pop()?.toLowerCase() ?? '';
+    if (SQL_EXTENSIONS.has(extension)) return 'sql';
+    if (extension === 'md' || extension === 'markdown') return 'markdown';
+    return 'text';
+}
+
+export function getSourceFileLanguage(filePath: string): string {
+    const extension = filePath.split('.').pop()?.toLowerCase() ?? '';
+    return SOURCE_LANGUAGES[extension] ?? 'plaintext';
+}
+
 export function getSavedQueryExportFileName(name?: string | null): string {
     if (!name) return 'query.sql';
     const trimmed = name.trim();
@@ -29,6 +96,8 @@ export function createSqlFileTab(filePath: string, query: string, schema?: strin
         type: 'console',
         title: getSqlFileName(filePath),
         query,
+        sourceFileKind: getSourceFileKind(filePath),
+        ...(!isSqlSourceFile(filePath) ? {readOnly: true} : {}),
         sourceFilePath: filePath,
         sourceFileContent: query,
         sourceFileDirty: false,

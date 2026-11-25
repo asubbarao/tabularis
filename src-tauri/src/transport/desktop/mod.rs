@@ -24,6 +24,7 @@ pub mod export;
 pub mod health_check;
 pub mod log_commands;
 pub mod mcp;
+pub mod mcp_file_requests;
 pub mod notebooks;
 pub mod plugins;
 pub mod preferences;
@@ -448,6 +449,9 @@ pub fn run(args: crate::cli::Args, log_buffer: crate::logger::SharedLogBuffer) {
             export::export_query_to_file,
             export::cancel_export,
             sql_file::read_sql_file,
+            mcp_file_requests::mcp_ui_ready,
+            mcp_file_requests::claim_mcp_ui_request,
+            mcp_file_requests::write_mcp_ui_response,
             sql_file::write_sql_file,
             saved_queries::get_saved_queries,
             saved_queries::save_query,

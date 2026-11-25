@@ -1775,6 +1775,17 @@
     "auto": "Auto"
   },
   "editor": {
+    "recentWorkingFiles": {
+      "title": "Recent files",
+      "clear": "Clear history",
+      "empty": "No recent files.",
+      "openFailed": "Could not reopen file: {{error}}",
+      "reopen": "Reopen {{path}}"
+    },
+    "workingFilePreview": {
+      "image": "Image preview",
+      "pdf": "PDF preview: {{path}}"
+    },
     "diagnostics": {
       "unresolvedRelation": "Table or view \"{{name}}\" was not found in the loaded metadata. It may be temporary or created after the metadata was loaded.",
       "unresolvedColumn": "Column \"{{name}}\" does not exist",

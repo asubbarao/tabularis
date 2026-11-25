@@ -211,6 +211,18 @@ import {useConnectionLayoutContext} from '@/hooks/useConnectionLayoutContext';
 import {useKeybindings} from '@/hooks/useKeybindings';
 import {usePlatformCapabilities} from '@/hooks/usePlatformCapabilities';
 import {openSqlFile, saveSqlFile} from '@/utils/sqlFileTransfer';
+import {
+    assertVisibleRequestCurrent,
+    assessVisibleResultCommit,
+    executeVisiblePreflight,
+    executeSqlSourceAction,
+    finishVisibleRequest,
+    getCommittedVisibleResults,
+    getVisibleResultsError,
+    isSqlSourceTab,
+    type VisibleResultPhase,
+} from '@/utils/visibleResultCommit';
+import {executeClaimedUiRequest} from '@/utils/mcpUiRequest';
 import {useSecondaryWindows} from '@/hooks/useSecondaryWindows';
 import type {
     BatchStatementResult,
@@ -221,10 +233,17 @@ import type {
     EditorNavigationIntent,
     EditorNavigationRequest,
 } from '@/types/editor';
+import {getSourceFileKind, getSourceFileLanguage} from '@/utils/sqlFile';
+import {RecentWorkingFiles} from '@/components/editor/RecentWorkingFiles';
 import {createEditorNavigationIntent, parseEditorNavigationIntent} from '@/utils/editorNavigation';
 import {CommandPaletteScopeBridge} from '@/components/layout/CommandPaletteScopeBridge';
 import type {CommandScope} from '@/types/commands';
-import {ROOT_COMMAND_SCOPE_ID} from '@/utils/commandScopeStore';
+import {
+    getActiveCommandScopeId,
+    isActiveCommandScope,
+    ROOT_COMMAND_SCOPE_ID,
+} from '@/utils/commandScopeStore';
+import {resolveRenderedSplitLayout} from '@/utils/connectionLayout';
 import {createActiveEditorCommands} from '@/utils/editorCommands';
 import {buildForeignKeyFilterClause} from '@/utils/foreignKeys';
 import {
@@ -244,7 +263,6 @@ import {getNextSortClause} from '@/utils/tableToolbar';
 import {clampTabGap, getAdjacentTabGap} from '@/utils/tabDnd';
 import {getBulkClosedTabIds} from '@/utils/tabPins';
 import {
-    createSqlFileTab,
     getSqlFileName,
     hasUnsavedSqlFileTabs,
     isSqlFileDirty,
@@ -302,6 +320,32 @@ interface EditorProps {
     commandScopeId?: string;
 }
 
+const sha256 = async (content: string) => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
+        '',
+    );
+};
+
+interface VisibleResultWaiter {
+    tabId: string;
+    phase: VisibleResultPhase;
+    previousResults: ReadonlyMap<string, object>;
+    expectedCount: number;
+    assertCurrent: () => void;
+    finish: (error?: Error) => void;
+    settled: boolean;
+    timeoutId?: number;
+}
+
+interface VisibleQueryExecutionContext {
+    requestId: string;
+    tabId: string;
+    connectionId: string;
+    assertCurrent: () => void;
+    validateSavedFile: () => Promise<void>;
+}
+
 export const Editor = ({commandScopeId}: EditorProps) => {
     const client = useTabularisClient();
     const platform = usePlatformCapabilities();
@@ -320,7 +364,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
         activeDatabaseName,
     } = useDatabase();
     const {allDrivers} = useDrivers();
-    const {explorerConnectionId} = useConnectionLayoutContext();
+    const {explorerConnectionId, isSplitVisible, splitView} = useConnectionLayoutContext();
     const {settings} = useSettings();
     const {saveQuery} = useSavedQueries();
     const {addEntry: addHistoryEntry} = useQueryHistory();
@@ -343,6 +387,11 @@ export const Editor = ({commandScopeId}: EditorProps) => {
         getRecentTabIds,
         reopenClosedTab,
         canReopenClosedTab,
+        recentWorkingFiles,
+        openWorkingFile,
+        clearRecentWorkingFiles,
+        waitForMcpOpenRequestListener,
+        markMcpRunRequestListenerReady,
     } = useEditor();
     const location = useLocation();
     const {matchesShortcut, isMac} = useKeybindings();
@@ -352,6 +401,8 @@ export const Editor = ({commandScopeId}: EditorProps) => {
     const navigate = useNavigate();
 
     const driverReadonly = isReadonly(activeCapabilities);
+    const canUseQueryParameters =
+        !activeTab?.sourceFilePath || getSourceFileKind(activeTab.sourceFilePath) === 'sql';
     const driverSupportsExplain = supportsExplain(activeCapabilities);
     // The connection's resolved SQL syntax (`sql_dialect` preset plus any
     // declared `sql_syntax`), passed wherever a dialect is needed. Cached per
@@ -653,29 +704,83 @@ export const Editor = ({commandScopeId}: EditorProps) => {
             const opened = await openSqlFile(platform, client, [
                 {
                     name: t('editor.sqlFileFilter'),
-                    extensions: ['sql', 'psql', 'pgsql'],
+                    extensions: [
+                        'sql',
+                        'psql',
+                        'pgsql',
+                        'md',
+                        'markdown',
+                        'tf',
+                        'hcl',
+                        'json',
+                        'jsonc',
+                        'yaml',
+                        'yml',
+                        'toml',
+                        'txt',
+                        'ini',
+                        'conf',
+                        'cfg',
+                        'sh',
+                        'bash',
+                        'rs',
+                        'ts',
+                        'tsx',
+                        'js',
+                        'jsx',
+                        'mjs',
+                        'mts',
+                        'py',
+                        'go',
+                        'java',
+                        'c',
+                        'h',
+                        'cc',
+                        'cpp',
+                        'hpp',
+                        'cs',
+                        'rb',
+                        'php',
+                        'swift',
+                        'css',
+                        'scss',
+                        'html',
+                        'xml',
+                        'svg',
+                        'vue',
+                        'svelte',
+                        'proto',
+                        'graphql',
+                        'gql',
+                        'prisma',
+                        'properties',
+                        'env',
+                        'log',
+                        'csv',
+                        'mdx',
+                    ],
                 },
             ]);
             if (!opened) return;
             const schema = isMultiDb ? selectedDatabases[0] : undefined;
-            addTab(
-                opened.kind === 'path'
-                    ? createSqlFileTab(opened.path, opened.query, schema)
-                    : {
-                          // An uploaded copy has no host path; saving it downloads a file.
-                          type: 'console',
-                          title: getSqlFileName(opened.name),
-                          query: opened.query,
-                          ...(schema ? {schema} : {}),
-                      },
-            );
+            if (opened.kind === 'path') {
+                await openWorkingFile(opened.path);
+            } else {
+                addTab({
+                    // An uploaded copy has no host path; saving it downloads a file.
+                    type: 'console',
+                    title: getSqlFileName(opened.name),
+                    query: opened.query,
+                    ...(schema ? {schema} : {}),
+                });
+            }
         } catch (error) {
             showAlert(`${t('editor.openSqlFileError')}: ${String(error)}`, {
                 title: t('common.error'),
                 kind: 'error',
             });
         }
-    }, [addTab, client, isMultiDb, platform, selectedDatabases, showAlert, t]);
+    }, [addTab, client, isMultiDb, openWorkingFile, platform, selectedDatabases, showAlert, t]);
 
     // Save is a no-op on a clean file and on an empty console (which would
     // otherwise open a Save As dialog for nothing).
@@ -803,6 +908,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
     const tabsRef = useRef<Tab[]>([]);
     const activeTabIdRef = useRef<string | null>(null);
     const activeConnectionIdRef = useRef(activeConnectionId);
+    const activeCommandScopeIdRef = useRef(ROOT_COMMAND_SCOPE_ID);
     const pendingTabCloseActionRef = useRef<(() => void) | null>(null);
     const [hasPendingSqlFileClose, setHasPendingSqlFileClose] = useState(false);
     // Last executed SQL per tab — used to preserve the loaded row count across
@@ -817,6 +923,8 @@ export const Editor = ({commandScopeId}: EditorProps) => {
     // Stable refs for functions used inside Monaco actions (which capture closures at mount time)
     const runQueryRef = useRef<typeof runQuery>(null!);
     const runMultipleQueriesRef = useRef<typeof runMultipleQueries>(null!);
+    const visibleResultWaitersRef = useRef(new Map<string, VisibleResultWaiter>());
+    const visibleResultRunIdsRef = useRef<Record<string, string>>({});
     const openExplainForQueryRef = useRef<(query: string) => void>(null!);
     const activeDialectRef = useRef<typeof activeDialect>(undefined);
     // Per-editor Monaco context keys that gate the Copy SQL Without Comments
@@ -1061,8 +1169,73 @@ export const Editor = ({commandScopeId}: EditorProps) => {
         tabsRef.current = tabs;
         activeTabIdRef.current = activeTabId;
         activeConnectionIdRef.current = activeConnectionId;
+        activeCommandScopeIdRef.current = getActiveCommandScopeId({
+            explorerConnectionId,
+            isSplitRendered: !!resolveRenderedSplitLayout({
+                splitView,
+                isSplitVisible,
+                pathname: location.pathname,
+            }),
+        });
         detachedTabIdsRef.current = detachedTabIds;
-    }, [tabs, activeTabId, activeConnectionId, detachedTabIds]);
+        for (const [requestId, waiter] of visibleResultWaitersRef.current) {
+            try {
+                waiter.assertCurrent();
+            } catch (error) {
+                waiter.finish(error instanceof Error ? error : new Error(String(error)));
+                continue;
+            }
+            const tab = tabs.find((item) => item.id === waiter.tabId);
+            if (!tab) {
+                waiter.finish(new Error('The SQL tab closed before its results rendered'));
+                continue;
+            }
+            if (activeTabId !== waiter.tabId || activeConnectionId !== tab.connectionId) {
+                waiter.finish(
+                    new Error(
+                        'The active tab or connection changed before the SQL results rendered',
+                    ),
+                );
+                continue;
+            }
+            const status = assessVisibleResultCommit(
+                waiter.phase,
+                requestId,
+                visibleResultRunIdsRef.current[waiter.tabId],
+                waiter.previousResults,
+                tab.results ?? [],
+                waiter.expectedCount,
+            );
+            if (status.status === 'superseded') {
+                waiter.finish(
+                    new Error('The visible SQL run was superseded before its results rendered'),
+                );
+            } else if (status.status === 'committed') {
+                waiter.finish();
+            }
+        }
+        for (const tabId of Object.keys(visibleResultRunIdsRef.current)) {
+            if (!tabs.some((tab) => tab.id === tabId)) delete visibleResultRunIdsRef.current[tabId];
+        }
+    }, [
+        tabs,
+        activeTabId,
+        activeConnectionId,
+        detachedTabIds,
+        explorerConnectionId,
+        isSplitVisible,
+        splitView,
+        location.pathname,
+    ]);
+
+    useEffect(
+        () => () => {
+            for (const waiter of visibleResultWaitersRef.current.values()) {
+                waiter.finish(new Error('The editor closed before the SQL results rendered'));
+            }
+        },
+        [],
+    );
 
     const requestTabClosure = useCallback((tabIds: string[], action: () => void) => {
         // EditorProvider releases a closed tab's session once it leaves the list.
@@ -1279,6 +1452,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
 
             const originalTab = tabsRef.current.find((t) => t.id === targetTabId);
             if (!originalTab) return;
+            if (!isSqlSourceTab(originalTab)) return;
             const targetConnectionId = originalTab.connectionId;
             const schedule = getAutoRefreshSchedule(targetTabId);
             if (!automaticRefresh) schedule.invalidate();
@@ -1286,6 +1460,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
             const execute = async () => {
                 const targetTab = tabsRef.current.find((t) => t.id === targetTabId);
                 if (!targetTab || targetTab.connectionId !== targetConnectionId) return false;
+                if (!isSqlSourceTab(targetTab)) return false;
                 const revision = schedule.getSnapshot().revision;
                 const identity = tableRefreshIdentity(targetTab);
                 const canApplyRefresh = (tab: Tab) =>
@@ -1381,6 +1556,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                 // Preserve total_rows across page changes so the count doesn't disappear
                 const previousTotalRows = targetTab?.result?.pagination?.total_rows ?? null;
 
+                visibleResultRunIdsRef.current[targetTabId] = createRequestId();
                 const generation = (queryGenerationRef.current[targetTabId] ?? 0) + 1;
                 queryGenerationRef.current[targetTabId] = generation;
 
@@ -1703,17 +1879,396 @@ export const Editor = ({commandScopeId}: EditorProps) => {
         ],
     );
 
+    useEffect(() => {
+        let disposed = false;
+        let runReadyAdvertised = false;
+        let unlisten: (() => void) | undefined;
+        const handled = new Set<string>();
+        const isCurrentCommandOwner = () =>
+            isActiveCommandScope(commandScopeId, activeCommandScopeIdRef.current);
+        const assertCurrentCommandOwner = () => {
+            if (disposed) throw new Error('The SQL editor was closed before the request completed');
+            if (!isCurrentCommandOwner())
+                throw new Error('The active editor pane changed before the request completed');
+        };
+        void client
+            .subscribe(
+                'mcp://ui_request',
+                (request: {
+                    id: string;
+                    kind: string;
+                    path?: string;
+                    expectedSha256?: string;
+                    responsePath: string;
+                }) => {
+                    if (
+                        disposed ||
+                        !isCurrentCommandOwner() ||
+                        request?.kind !== 'run_visible_tab' ||
+                        !request.id ||
+                        handled.has(request.id)
+                    )
+                        return;
+                    handled.add(request.id);
+                    void (async () => {
+                        let waiter: VisibleResultWaiter | undefined;
+                        const respond = (result: Record<string, unknown>) =>
+                            client.call('write_mcp_ui_response', {
+                                path: request.responsePath,
+                                content: JSON.stringify(result),
+                            });
+                        try {
+                            await executeClaimedUiRequest(
+                                () => client.call('claim_mcp_ui_request', {id: request.id}),
+                                async () => {
+                                    assertCurrentCommandOwner();
+                                    if (!request.path || !request.expectedSha256)
+                                        throw new Error(
+                                            'A SQL path and expected SHA-256 are required',
+                                        );
+                                    const sourcePath = request.path;
+                                    const expectedSha256 = request.expectedSha256;
+                                    const initialTab = tabsRef.current.find(
+                                        (item) => item.sourceFilePath === sourcePath,
+                                    );
+                                    if (!initialTab || initialTab.type !== 'console')
+                                        throw new Error(
+                                            'SQL file is not open in a visible editor tab',
+                                        );
+                                    if (!isSqlSourceTab(initialTab))
+                                        throw new Error('Only SQL files can be executed');
+                                    if (initialTab.sourceFileDirty)
+                                        throw new Error('The visible SQL tab has unsaved edits');
+                                    if (initialTab.connectionId !== activeConnectionIdRef.current)
+                                        throw new Error(
+                                            'The SQL tab is not on the active connection',
+                                        );
+                                    if (initialTab.id !== activeTabIdRef.current)
+                                        throw new Error(
+                                            'Activate the SQL file tab before running it',
+                                        );
+                                    const tabId = initialTab.id;
+                                    const connectionId = initialTab.connectionId;
+                                    const originalQuery = initialTab.query;
+                                    const queryParams = {...(initialTab.queryParams ?? {})};
+                                    const assertVisibleContext = () => {
+                                        assertCurrentCommandOwner();
+                                        assertVisibleRequestCurrent(
+                                            waiter,
+                                            request.id,
+                                            visibleResultRunIdsRef.current[tabId],
+                                            disposed,
+                                        );
+                                        const current = tabsRef.current.find(
+                                            (item) => item.id === tabId,
+                                        );
+                                        if (
+                                            !current ||
+                                            current.type !== 'console' ||
+                                            current.sourceFilePath !== sourcePath
+                                        )
+                                            throw new Error(
+                                                'The visible SQL tab changed before execution',
+                                            );
+                                        if (
+                                            current.sourceFileDirty ||
+                                            current.query !== originalQuery
+                                        )
+                                            throw new Error(
+                                                'The visible SQL tab was edited before execution',
+                                            );
+                                        if (
+                                            current.connectionId !== connectionId ||
+                                            activeConnectionIdRef.current !== connectionId
+                                        )
+                                            throw new Error(
+                                                'The SQL tab connection changed before execution',
+                                            );
+                                        if (activeTabIdRef.current !== tabId)
+                                            throw new Error(
+                                                'The active SQL tab changed before execution',
+                                            );
+                                        const currentParams = current.queryParams ?? {};
+                                        if (
+                                            Object.keys(currentParams).length !==
+                                                Object.keys(queryParams).length ||
+                                            Object.entries(queryParams).some(
+                                                ([key, value]) => currentParams[key] !== value,
+                                            )
+                                        )
+                                            throw new Error(
+                                                'The SQL query parameters changed before execution',
+                                            );
+                                        return current;
+                                    };
+                                    let content = '';
+                                    let hash = '';
+                                    await executeVisiblePreflight(
+                                        assertVisibleContext,
+                                        [
+                                            async () => {
+                                                content = await client.call('read_sql_file', {
+                                                    path: sourcePath,
+                                                });
+                                            },
+                                            async () => {
+                                                hash = await sha256(content);
+                                            },
+                                        ],
+                                        async () => {
+                                            if (hash !== expectedSha256)
+                                                throw new Error(
+                                                    'The saved SQL file changed; reopen it and retry with its current SHA-256',
+                                                );
+                                            if (assertVisibleContext().query !== content)
+                                                throw new Error(
+                                                    'The visible SQL tab does not match the saved file; reopen it and retry',
+                                                );
+                                        },
+                                    );
+                                    const tab = assertVisibleContext();
+                                    const queries = splitQueries(content, activeDialect);
+                                    if (queries.length === 0)
+                                        throw new Error(
+                                            'The SQL file contains no executable statements',
+                                        );
+                                    const missingParameters = [
+                                        ...new Set(
+                                            queries.flatMap((query) =>
+                                                extractQueryParams(query, activeDialect),
+                                            ),
+                                        ),
+                                    ].filter((name) => {
+                                        const value = queryParams[name];
+                                        return value === undefined || value.trim() === '';
+                                    });
+                                    if (missingParameters.length > 0) {
+                                        throw new Error(
+                                            `SQL file requires query parameters: ${missingParameters.join(', ')}`,
+                                        );
+                                    }
+                                    const executionContext: VisibleQueryExecutionContext = {
+                                        requestId: request.id,
+                                        tabId,
+                                        connectionId,
+                                        assertCurrent: assertVisibleContext,
+                                        validateSavedFile: async () => {
+                                            let currentContent = '';
+                                            let currentHash = '';
+                                            await executeVisiblePreflight(
+                                                assertVisibleContext,
+                                                [
+                                                    async () => {
+                                                        currentContent = await client.call(
+                                                            'read_sql_file',
+                                                            {path: sourcePath},
+                                                        );
+                                                    },
+                                                    async () => {
+                                                        currentHash = await sha256(currentContent);
+                                                    },
+                                                ],
+                                                async () => {
+                                                    if (
+                                                        currentHash !== hash ||
+                                                        currentContent !== content
+                                                    )
+                                                        throw new Error(
+                                                            'The saved SQL file changed before execution; reopen it and retry',
+                                                        );
+                                                },
+                                            );
+                                        },
+                                    };
+                                    let confirmRendered: (error?: Error) => void = () => undefined;
+                                    const rendered = new Promise<Error | undefined>((resolve) => {
+                                        const previousResults = new Map(
+                                            (tab.results ?? []).map((entry) => [entry.id, entry]),
+                                        );
+                                        const nextWaiter: VisibleResultWaiter = {
+                                            tabId: tab.id,
+                                            phase: 'starting',
+                                            previousResults,
+                                            expectedCount: queries.length,
+                                            assertCurrent: assertVisibleContext,
+                                            settled: false,
+                                            finish: (error) => {
+                                                if (
+                                                    !waiter ||
+                                                    !finishVisibleRequest(waiter, () =>
+                                                        visibleResultWaitersRef.current.delete(
+                                                            request.id,
+                                                        ),
+                                                    )
+                                                )
+                                                    return;
+                                                if (waiter.timeoutId !== undefined)
+                                                    window.clearTimeout(waiter.timeoutId);
+                                                resolve(error);
+                                            },
+                                        };
+                                        waiter = nextWaiter;
+                                        confirmRendered = (error) => nextWaiter.finish(error);
+                                        visibleResultWaitersRef.current.set(request.id, nextWaiter);
+                                    });
+                                    await runMultipleQueriesRef.current(
+                                        queries,
+                                        queryParams,
+                                        request.id,
+                                        executionContext,
+                                    );
+                                    if (visibleResultRunIdsRef.current[tab.id] !== request.id) {
+                                        confirmRendered(
+                                            new Error(
+                                                'SQL execution did not start; check the execution guard or query parameters',
+                                            ),
+                                        );
+                                    } else if (waiter && !waiter.settled) {
+                                        waiter.timeoutId = window.setTimeout(
+                                            () =>
+                                                confirmRendered(
+                                                    new Error(
+                                                        'Timed out waiting for the SQL results to render in the editor tab',
+                                                    ),
+                                                ),
+                                            5_000,
+                                        );
+                                    }
+                                    const renderError = await rendered;
+                                    if (renderError) throw renderError;
+                                    const updated = tabsRef.current.find(
+                                        (item) => item.id === tab.id,
+                                    );
+                                    const entries = updated
+                                        ? getCommittedVisibleResults(
+                                              waiter!.previousResults,
+                                              updated.results ?? [],
+                                              queries.length,
+                                          )
+                                        : null;
+                                    if (!entries) {
+                                        throw new Error(
+                                            'Tabularis did not produce a visible result for every SQL statement',
+                                        );
+                                    }
+                                    const results = entries.map((entry) => ({
+                                        query: entry.query,
+                                        error: entry.error || null,
+                                        result: entry.result
+                                            ? {
+                                                  columns: entry.result.columns,
+                                                  totalRows:
+                                                      entry.result.pagination?.total_rows ?? null,
+                                                  rows: entry.result.rows.slice(0, 20),
+                                              }
+                                            : null,
+                                    }));
+                                    const error =
+                                        getVisibleResultsError(entries) ?? updated?.error ?? null;
+                                    await respond({
+                                        ok: !error,
+                                        path: request.path,
+                                        sha256: hash,
+                                        renderedInTab: tab.id,
+                                        error,
+                                        results,
+                                    });
+                                },
+                            );
+                        } catch (error) {
+                            await respond({ok: false, error: String(error)});
+                        } finally {
+                            waiter?.finish(new Error('Visible SQL request completed'));
+                            handled.delete(request.id);
+                        }
+                    })();
+                },
+            )
+            .then(async (stop) => {
+                if (disposed) {
+                    stop();
+                    return;
+                }
+                unlisten = stop;
+                if (!isCurrentCommandOwner()) return;
+                try {
+                    await waitForMcpOpenRequestListener();
+                    if (!disposed && isCurrentCommandOwner()) {
+                        try {
+                            await client.call('mcp_ui_ready', {
+                                kind: 'run_visible_tab',
+                                ready: true,
+                            });
+                            runReadyAdvertised = true;
+                        } catch {
+                            // Browser transports still need the in-process display-ready signal.
+                        }
+                        if (!disposed && isCurrentCommandOwner())
+                            markMcpRunRequestListenerReady(true);
+                    }
+                } catch {
+                    // Browser transports do not expose the desktop request watcher.
+                }
+            });
+        return () => {
+            disposed = true;
+            markMcpRunRequestListenerReady(false);
+            unlisten?.();
+            if (runReadyAdvertised) {
+                void client
+                    .call('mcp_ui_ready', {kind: 'run_visible_tab', ready: false})
+                    .catch(() => {});
+            }
+        };
+    }, [
+        activeDialect,
+        client,
+        commandScopeId,
+        explorerConnectionId,
+        isSplitVisible,
+        splitView,
+        location.pathname,
+        waitForMcpOpenRequestListener,
+        markMcpRunRequestListenerReady,
+    ]);
+
     const runMultipleQueries = useCallback(
-        async (queries: string[], paramsOverride?: Record<string, string>) => {
-            const targetTabId = activeTabIdRef.current;
-            if (!activeConnectionId || !targetTabId) return;
+        async (
+            queries: string[],
+            paramsOverride?: Record<string, string>,
+            visibleRequestId?: string,
+            visibleExecution?: VisibleQueryExecutionContext,
+        ) => {
+            const targetTabId = visibleExecution?.tabId ?? activeTabIdRef.current;
+            const targetConnectionId = visibleExecution?.connectionId ?? activeConnectionId;
+            if (!targetConnectionId || !targetTabId) return;
 
-            const targetTab = tabsRef.current.find((t) => t.id === targetTabId);
+            let targetTab = visibleExecution
+                ? (visibleExecution.assertCurrent(),
+                  tabsRef.current.find((t) => t.id === targetTabId))
+                : tabsRef.current.find((t) => t.id === targetTabId);
             if (!targetTab) return;
+            if (targetTab.connectionId !== targetConnectionId) return;
+            if (!isSqlSourceTab(targetTab)) return;
 
-            const mayRun = await guardQueryExecution(
-                queries.flatMap((q) => splitQueries(q, activeDialect)),
-            );
+            let mayRun = false;
+            const guard = async () => {
+                mayRun = await guardQueryExecution(
+                    queries.flatMap((q) => splitQueries(q, activeDialect)),
+                );
+            };
+            if (visibleExecution) {
+                await executeVisiblePreflight(
+                    visibleExecution.assertCurrent,
+                    [guard],
+                    async () => undefined,
+                );
+                targetTab = tabsRef.current.find((t) => t.id === targetTabId);
+                if (!targetTab || targetTab.connectionId !== targetConnectionId) return;
+                if (!isSqlSourceTab(targetTab)) return;
+            } else {
+                await guard();
+            }
             if (!mayRun) return;
 
             // Collect all unique parameters across all queries
@@ -1753,6 +2308,11 @@ export const Editor = ({commandScopeId}: EditorProps) => {
 
             // Entry ids are reused per tab, so drop offsets from the previous run.
             clearEntryScrollTops(targetTabId);
+            visibleResultRunIdsRef.current[targetTabId] = visibleRequestId ?? createRequestId();
+            if (visibleRequestId) {
+                const waiter = visibleResultWaitersRef.current.get(visibleRequestId);
+                if (waiter?.tabId === targetTabId) waiter.phase = 'running';
+            }
             const entries = createResultEntries(targetTabId, queries);
 
             setIsResultsCollapsed(false);
@@ -1821,39 +2381,54 @@ export const Editor = ({commandScopeId}: EditorProps) => {
             // A unique id ties the live events to this run, so a listener ignores
             // events from any other batch executing concurrently.
             const batchId = `batch-${targetTabId}-${performance.now()}`;
-            // Registered before `invoke` so no early statement event is missed.
-            const unlisten = await client.subscribe('batch-statement-complete', (p) => {
-                if (p.batch_id !== batchId || applied.has(p.index)) return;
-                applied.add(p.index);
-                applyStatement(p.index, p.statement);
-            });
-
-            // Run the whole script on a single pooled connection so statements
-            // can share session state (SET @var, LAST_INSERT_ID(), transactions,
-            // TEMP TABLE).
-            const batchStart = performance.now();
+            let unlisten: () => void = () => undefined;
+            let batchStart = performance.now();
             let batchResults: BatchStatementResult[];
             const queryRequestId = createRequestId();
             activeQueryRequestIdsRef.current.add(queryRequestId);
             try {
-                batchResults = await client.call(
-                    'execute_query_batch',
-                    {
-                        connectionId: activeConnectionId,
-                        queries: entries.map((e) => e.query),
-                        // Capture a snapshot per statement: later pages are cut from
-                        // it, since re-running a statement after the batch would see
-                        // different session state (#205).
-                        limit: batchSnapshotLimit(pageSize),
-                        page: 1,
-                        batchId,
-                        // The tab is the session: a transaction it leaves open keeps
-                        // this tab's connection so the next run continues it.
-                        sessionId: targetTabId,
-                        ...(schema ? {schema} : {}),
-                        ...(targetTab?.database ? {database: targetTab.database} : {}),
+                batchResults = await executeVisiblePreflight(
+                    visibleExecution?.assertCurrent ?? (() => undefined),
+                    [
+                        async () => {
+                            // Register before execution so no early statement event is missed.
+                            unlisten = await client.subscribe('batch-statement-complete', (p) => {
+                                if (p.batch_id !== batchId || applied.has(p.index)) return;
+                                applied.add(p.index);
+                                applyStatement(p.index, p.statement);
+                            });
+                        },
+                        async () => {
+                            if (visibleExecution) await visibleExecution.validateSavedFile();
+                        },
+                    ],
+                    async () => {
+                        visibleExecution?.assertCurrent();
+                        batchStart = performance.now();
+                        const batch = executeSqlSourceAction(targetTab, () =>
+                            client.call(
+                                'execute_query_batch',
+                                {
+                                    connectionId: targetConnectionId,
+                                    queries: entries.map((e) => e.query),
+                                    // Capture a snapshot per statement: later pages are cut from
+                                    // it, since re-running a statement after the batch would see
+                                    // different session state (#205).
+                                    limit: batchSnapshotLimit(pageSize),
+                                    page: 1,
+                                    batchId,
+                                    // The tab is the session: a transaction it leaves open keeps
+                                    // this tab's connection so the next run continues it.
+                                    sessionId: targetTabId,
+                                    ...(schema ? {schema} : {}),
+                                    ...(targetTab?.database ? {database: targetTab.database} : {}),
+                                },
+                                {requestId: queryRequestId, cancellationId: queryRequestId},
+                            ),
+                        );
+                        if (!batch) throw new Error('Only SQL files can be executed');
+                        return batch;
                     },
-                    {requestId: queryRequestId, cancellationId: queryRequestId},
                 );
             } catch (err) {
                 unlisten();
@@ -1955,6 +2530,8 @@ export const Editor = ({commandScopeId}: EditorProps) => {
             activeDialect,
         ],
     );
+
+    runMultipleQueriesRef.current = runMultipleQueries;
 
     // Auto-run entry point for navigation-initiated executions (sidebar "open
     // and run" flows). Multi-statement scripts — e.g. a routine invocation with
@@ -2620,7 +3197,12 @@ export const Editor = ({commandScopeId}: EditorProps) => {
             : runButtonBase;
 
     const handleRunAll = useCallback(() => {
-        if (!activeTab) return;
+        if (
+            !activeTab ||
+            activeTab.readOnly ||
+            (activeTab.sourceFilePath && getSourceFileKind(activeTab.sourceFilePath) !== 'sql')
+        )
+            return;
         // Prefer the live editor content — activeTab.query lags behind by the
         // onChange debounce.
         const editor = editorsRef.current[activeTab.id];
@@ -2632,7 +3214,12 @@ export const Editor = ({commandScopeId}: EditorProps) => {
     }, [activeTab, activeDialect, runQuery, runMultipleQueries]);
 
     const handleRunButton = useCallback(() => {
-        if (!activeTab) return;
+        if (
+            !activeTab ||
+            activeTab.readOnly ||
+            (activeTab.sourceFilePath && getSourceFileKind(activeTab.sourceFilePath) !== 'sql')
+        )
+            return;
 
         // Table Tab: run query with filter/sort/limit from activeTab
         if (activeTab.type === 'table') {
@@ -5286,6 +5873,11 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                 >
                     <FolderOpen size={16} />
                 </button>
+                <RecentWorkingFiles
+                    paths={recentWorkingFiles}
+                    onOpen={(path) => openWorkingFile(path)}
+                    onClear={clearRecentWorkingFiles}
+                />
                 <button
                     onClick={() => addTab({type: 'query_builder'})}
                     className="flex items-center justify-center w-9 h-full text-accent-secondary hover:text-primary hover:bg-surface-secondary border-l border-default transition-colors shrink-0"
@@ -5424,7 +6016,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                     ) : null}
 
                     {/* Params Button */}
-                    {!isTableTab && (
+                    {!isTableTab && canUseQueryParameters && (
                         <button
                             onClick={handleEditParams}
                             disabled={!hasQueryParams}
@@ -5762,6 +6354,11 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                             <SqlEditorWrapper
                                 height="100%"
                                 initialValue={tab.query}
+                                language={
+                                    tab.sourceFilePath
+                                        ? getSourceFileLanguage(tab.sourceFilePath)
+                                        : 'sql'
+                                }
                                 dialect={activeDialect}
                                 foldPreview
                                 cursorStatus
@@ -5791,7 +6388,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                         )}
 
                         {/* Editor overlay buttons — bottom-right */}
-                        {tab.type !== 'query_builder' && (
+                        {tab.type !== 'query_builder' && isSqlSourceTab(tab) && (
                             <div className="absolute bottom-2 right-6 z-10 flex items-center gap-1">
                                 {/* Visual Explain — hidden for read-only definition tabs and drivers without EXPLAIN support */}
                                 {!tab.readOnly && driverSupportsExplain && (
@@ -6932,7 +7529,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                 onClose={closeExportModal}
             />
             <QueryParamsModal
-                isOpen={queryParamsModal.isOpen}
+                isOpen={queryParamsModal.isOpen && canUseQueryParameters}
                 onClose={() => setQueryParamsModal((prev) => ({...prev, isOpen: false}))}
                 onSubmit={handleParamsSubmit}
                 parameters={queryParamsModal.parameters}

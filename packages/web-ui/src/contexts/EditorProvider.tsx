@@ -1,8 +1,10 @@
 import {useState, useEffect, useMemo, useCallback, useRef} from 'react';
+import {useLocation, useNavigate} from 'react-router-dom';
 import type {ReactNode} from 'react';
 import type {Tab, SchemaCache, TableSchema, QueryResultEntry} from '@/types/editor';
 import {EditorContext, type AddTabOptions} from './EditorContext';
 import {useDatabase} from '@/hooks/useDatabase';
+import {useConnectionLayoutContext} from '@/hooks/useConnectionLayoutContext';
 import {useTabularisClient} from '@/hooks/useTabularisClient';
 import {forgetResultChartStates} from '@/hooks/useResultChartState';
 import {forgetHiddenColumns} from '@/hooks/useHiddenColumns';
@@ -36,13 +38,115 @@ import {
     type ClosedTabsByConnection,
 } from '@/utils/closedTabs';
 import {createNotebookFromState, evictFromCache, flushAllPendingSaves} from '@/utils/notebookStore';
+import {createSqlFileTab, getSourceFileKind, getSqlFileName} from '@/utils/sqlFile';
+import {UI_STATE_KEYS} from '@/utils/uiStateStore';
+import {useUiState} from '@/hooks/useUiState';
+import {
+    getActiveCommandScopeId,
+    isActiveCommandScope,
+    ROOT_COMMAND_SCOPE_ID,
+} from '@/utils/commandScopeStore';
+import {resolveRenderedSplitLayout} from '@/utils/connectionLayout';
+import {BROWSER_ROUTES, buildEditorRoute} from '@/routing';
+import {
+    registerWorkingFileOpenHandler,
+    waitForWorkingFileOpenHandler,
+} from '@/utils/workingFileOpenRouter';
+import {
+    enqueueWorkingFileOpen,
+    isWorkingFileRequestOwner,
+    isWorkingFileOpenCurrent,
+    isWorkingFileBufferReady,
+    reloadCleanWorkingFileBuffer,
+    updateRecentWorkingFiles,
+    getRoutedWorkingFileOpenHandler,
+    type RoutedWorkingFileOpenHandler,
+} from '@/utils/workingFiles';
+import {executeClaimedUiRequest} from '@/utils/mcpUiRequest';
 
-export const EditorProvider = ({children}: {children: ReactNode}) => {
+interface McpUiRequest {
+    id: string;
+    kind: 'open_files' | 'list_visible_tabs' | 'run_visible_tab';
+    paths: string[];
+    path?: string;
+    expectedSha256?: string;
+    connectionId?: string;
+    responsePath: string;
+}
+
+const sha256 = async (content: string) => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
+        '',
+    );
+};
+
+export const EditorProvider = ({
+    children,
+    commandScopeId,
+}: {
+    children: ReactNode;
+    commandScopeId?: string;
+}) => {
+    const {
+        explorerConnectionId,
+        isSplitVisible,
+        splitView,
+        setExplorerConnectionId,
+        addConnectionToSplit,
+        hideSplitView,
+    } = useConnectionLayoutContext();
+    const navigate = useNavigate();
+    const location = useLocation();
+    const renderedSplitLayout = resolveRenderedSplitLayout({
+        splitView,
+        isSplitVisible,
+        pathname: location.pathname,
+    });
+    const layoutRef = useRef({
+        splitView,
+        isSplitVisible,
+        explorerConnectionId,
+        pathname: location.pathname,
+    });
+    layoutRef.current = {
+        splitView,
+        isSplitVisible,
+        explorerConnectionId,
+        pathname: location.pathname,
+    };
+    const activeCommandScopeIdRef = useRef(ROOT_COMMAND_SCOPE_ID);
+    activeCommandScopeIdRef.current = getActiveCommandScopeId({
+        explorerConnectionId,
+        isSplitRendered: !!renderedSplitLayout,
+    });
     const client = useTabularisClient();
-    const {activeConnectionId} = useDatabase();
+    const mountedRef = useRef(true);
+    const runRequestListenerReady = useRef(false);
+    const runRequestListenerWaiters = useRef(new Set<() => void>());
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            runRequestListenerReady.current = false;
+        };
+    }, []);
+    const {activeConnectionId, connect, switchConnection, isConnectionOpen} = useDatabase();
+    const [recentWorkingFiles, setRecentWorkingFiles] = useUiState<string[]>(
+        UI_STATE_KEYS.recentWorkingFiles,
+        [],
+    );
+    const recentWorkingFilesRef = useRef(recentWorkingFiles);
+    recentWorkingFilesRef.current = recentWorkingFiles;
     const [tabs, setTabs] = useState<Tab[]>([]);
     const [activeTabIds, setActiveTabIds] = useState<Record<string, string>>({});
+    const activeTabIdsRef = useRef(activeTabIds);
+    activeTabIdsRef.current = activeTabIds;
     const [isLoading, setIsLoading] = useState(true);
+    const activeConnectionIdRef = useRef(activeConnectionId);
+    const isLoadingRef = useRef(isLoading);
+    activeConnectionIdRef.current = activeConnectionId;
+    isLoadingRef.current = isLoading;
     const recentTabs = useRef<Record<string, string[]>>({});
     const previewTabs = useRef<Record<string, string | null>>({});
     const historySnapshot = useRef<{
@@ -95,6 +199,38 @@ export const EditorProvider = ({children}: {children: ReactNode}) => {
     // canReopenClosedTab while reads stay synchronous across quick presses.
     const [closedTabs, setClosedTabs] = useState<ClosedTabsByConnection>({});
     const closedTabsRef = useRef<ClosedTabsByConnection>({});
+    const handledMcpRequestIds = useRef(new Set<string>());
+    const openRequestListenerReady = useRef<Promise<void> | null>(null);
+    const markOpenRequestListenerReady = useRef<() => void>(() => {});
+    if (!openRequestListenerReady.current) {
+        openRequestListenerReady.current = new Promise<void>((resolve) => {
+            markOpenRequestListenerReady.current = resolve;
+        });
+    }
+    const waitForMcpOpenRequestListener = useCallback(() => openRequestListenerReady.current!, []);
+    const waitForMcpRunRequestListener = useCallback(() => {
+        if (runRequestListenerReady.current) return Promise.resolve();
+        return new Promise<void>((resolve, reject) => {
+            let timeout: number;
+            const ready = () => {
+                window.clearTimeout(timeout);
+                runRequestListenerWaiters.current.delete(ready);
+                resolve();
+            };
+            timeout = window.setTimeout(() => {
+                runRequestListenerWaiters.current.delete(ready);
+                reject(new Error('The editor did not become ready to display the file'));
+            }, 20_000);
+            runRequestListenerWaiters.current.add(ready);
+        });
+    }, []);
+    const markMcpRunRequestListenerReady = useCallback((ready: boolean) => {
+        runRequestListenerReady.current = ready;
+        if (!ready) return;
+        runRequestListenerWaiters.current.forEach((resolve) => resolve());
+        runRequestListenerWaiters.current.clear();
+    }, []);
+    const openFilesQueueRef = useRef<Promise<void>>(Promise.resolve());
 
     const schemaCacheRef = useRef<Record<string, SchemaCache>>({});
     const tabsRef = useRef<Tab[]>([]);
@@ -177,6 +313,13 @@ export const EditorProvider = ({children}: {children: ReactNode}) => {
             try {
                 const {tabs: loadedTabs, activeTabId: loadedActiveTabId} =
                     await loadEditorPreferences(client, activeConnectionId);
+
+                for (const tab of loadedTabs) {
+                    if (tab.sourceFilePath && !tab.sourceFileKind) {
+                        tab.sourceFileKind = getSourceFileKind(tab.sourceFilePath);
+                        if (tab.sourceFileKind !== 'sql') tab.readOnly = true;
+                    }
+                }
 
                 // Migrate old notebook tabs: notebookState → notebookId
                 for (const tab of loadedTabs) {
@@ -340,6 +483,499 @@ export const EditorProvider = ({children}: {children: ReactNode}) => {
         },
         [createInitialTab, activeConnectionId, setActiveTabId],
     );
+    const addTabRef = useRef(addTab);
+    const setActiveTabIdRef = useRef(setActiveTabId);
+    addTabRef.current = addTab;
+    setActiveTabIdRef.current = setActiveTabId;
+
+    const clearRecentWorkingFiles = useCallback(
+        () => setRecentWorkingFiles([]),
+        [setRecentWorkingFiles],
+    );
+
+    const openWorkingFile = useCallback(
+        async (
+            filePath: string,
+            targetConnectionId?: string,
+        ): Promise<{
+            tabId: string;
+            content: string;
+            connectionId: string;
+            dirty: boolean;
+            sha256?: string;
+        }> => {
+            const expectedScopeId = commandScopeId ?? ROOT_COMMAND_SCOPE_ID;
+            const assertOpenCurrent = () => {
+                if (
+                    !isWorkingFileOpenCurrent(
+                        mountedRef.current,
+                        expectedScopeId,
+                        activeCommandScopeIdRef.current,
+                    )
+                ) {
+                    if (!mountedRef.current)
+                        throw new Error('The editor closed while the file was loading');
+                    throw new Error('The selected editor pane changed while the file was loading');
+                }
+            };
+            const scopeDeadline = Date.now() + 20_000;
+            while (activeCommandScopeIdRef.current !== expectedScopeId) {
+                if (!mountedRef.current)
+                    throw new Error('The editor closed while the file was loading');
+                if (Date.now() >= scopeDeadline)
+                    throw new Error('The selected editor pane did not become active');
+                await new Promise((resolve) => window.setTimeout(resolve, 25));
+            }
+            assertOpenCurrent();
+            if (targetConnectionId && targetConnectionId !== activeConnectionIdRef.current) {
+                if (isConnectionOpen(targetConnectionId)) switchConnection(targetConnectionId);
+                else await connect(targetConnectionId);
+                assertOpenCurrent();
+                const deadline = Date.now() + 20_000;
+                while (
+                    activeConnectionIdRef.current !== targetConnectionId ||
+                    isLoadingRef.current
+                ) {
+                    assertOpenCurrent();
+                    if (Date.now() >= deadline)
+                        throw new Error('Timed out switching database connections');
+                    await new Promise((resolve) => window.setTimeout(resolve, 50));
+                }
+                assertOpenCurrent();
+            }
+
+            const loadDeadline = Date.now() + 20_000;
+            while (activeConnectionIdRef.current && isLoadingRef.current) {
+                assertOpenCurrent();
+                if (Date.now() >= loadDeadline)
+                    throw new Error('Timed out loading the connection editor');
+                await new Promise((resolve) => window.setTimeout(resolve, 25));
+            }
+            assertOpenCurrent();
+
+            const connectionId = targetConnectionId ?? activeConnectionIdRef.current;
+            if (!connectionId) throw new Error('Open a database connection in Tabularis first');
+            if (renderedSplitLayout?.connectionIds.includes(connectionId)) {
+                setExplorerConnectionId(connectionId);
+                navigate(BROWSER_ROUTES.editor);
+            } else {
+                navigate(buildEditorRoute(connectionId));
+            }
+            await waitForMcpRunRequestListener();
+            assertOpenCurrent();
+            const startingActiveTabId = activeTabIdsRef.current[connectionId] ?? null;
+
+            const sourceFileKind = getSourceFileKind(filePath);
+            const content = await client.call('read_sql_file', {path: filePath});
+            assertOpenCurrent();
+            if (
+                activeConnectionIdRef.current !== connectionId ||
+                activeTabIdsRef.current[connectionId] !== startingActiveTabId
+            ) {
+                throw new Error(
+                    'The active connection or editor tab changed while the file was loading',
+                );
+            }
+            const existing = tabsRef.current.find(
+                (tab) => tab.connectionId === connectionId && tab.sourceFilePath === filePath,
+            );
+            let tabId: string;
+            if (existing) {
+                tabId = existing.id;
+                if (!existing.sourceFileDirty) {
+                    setTabs((previous) =>
+                        previous.map((tab) =>
+                            tab.id === existing.id
+                                ? reloadCleanWorkingFileBuffer(tab, content)
+                                : tab,
+                        ),
+                    );
+                }
+                if (
+                    activeConnectionIdRef.current !== connectionId ||
+                    activeTabIdsRef.current[connectionId] !== startingActiveTabId
+                ) {
+                    throw new Error(
+                        'The active connection or editor tab changed while the file was loading',
+                    );
+                }
+                setActiveTabIdRef.current(existing.id);
+            } else {
+                if (
+                    activeConnectionIdRef.current !== connectionId ||
+                    activeTabIdsRef.current[connectionId] !== startingActiveTabId
+                ) {
+                    throw new Error(
+                        'The active connection or editor tab changed while the file was loading',
+                    );
+                }
+                tabId = addTabRef.current({
+                    ...createSqlFileTab(filePath, content),
+                    connectionId,
+                    sourceFileKind,
+                });
+            }
+
+            const deadline = Date.now() + 10_000;
+            while (true) {
+                assertOpenCurrent();
+                const committedTab = tabsRef.current.find((tab) => tab.id === tabId);
+                const isActive = activeTabIdsRef.current[connectionId] === tabId;
+                const currentActiveTabId = activeTabIdsRef.current[connectionId] ?? null;
+                if (
+                    activeConnectionIdRef.current !== connectionId ||
+                    (currentActiveTabId !== startingActiveTabId && currentActiveTabId !== tabId)
+                ) {
+                    throw new Error(
+                        'The active connection or editor tab changed while the file was opening',
+                    );
+                }
+                if (
+                    committedTab &&
+                    isActive &&
+                    isWorkingFileBufferReady(committedTab, filePath, sourceFileKind, content)
+                ) {
+                    const currentContent = committedTab.query;
+                    const nextRecentFiles = updateRecentWorkingFiles(
+                        recentWorkingFilesRef.current,
+                        filePath,
+                    );
+                    recentWorkingFilesRef.current = nextRecentFiles;
+                    setRecentWorkingFiles(nextRecentFiles);
+                    return {
+                        tabId,
+                        content: currentContent,
+                        connectionId,
+                        dirty: committedTab.sourceFileDirty === true,
+                        sha256: await sha256(content),
+                    };
+                }
+                if (Date.now() >= deadline)
+                    throw new Error(`Timed out waiting for ${getSqlFileName(filePath)} to open`);
+                await new Promise((resolve) => window.setTimeout(resolve, 25));
+            }
+        },
+        [
+            client,
+            commandScopeId,
+            connect,
+            isConnectionOpen,
+            navigate,
+            renderedSplitLayout,
+            setExplorerConnectionId,
+            setRecentWorkingFiles,
+            switchConnection,
+            waitForMcpRunRequestListener,
+        ],
+    );
+
+    useEffect(() => {
+        if (!commandScopeId) return;
+        return registerWorkingFileOpenHandler(commandScopeId, (path) =>
+            openWorkingFile(path, commandScopeId),
+        );
+    }, [commandScopeId, openWorkingFile]);
+
+    useEffect(() => {
+        let disposed = false;
+        let openReadyAdvertised = false;
+        const onConnectionsPage =
+            !commandScopeId && location.pathname === BROWSER_ROUTES.connections;
+        let unlisten: (() => void) | undefined;
+        const isCurrentCommandOwner = (request: McpUiRequest) => {
+            const currentSplit = resolveRenderedSplitLayout({
+                splitView: layoutRef.current.splitView,
+                isSplitVisible: layoutRef.current.isSplitVisible,
+                pathname: layoutRef.current.pathname,
+            });
+            return isWorkingFileRequestOwner({
+                commandScopeId,
+                activeCommandScopeId: activeCommandScopeIdRef.current,
+                connectionId: request.kind === 'open_files' ? request.connectionId : undefined,
+                splitConnectionIds: currentSplit?.connectionIds,
+                isSplitRendered: !!currentSplit,
+            });
+        };
+        const isActiveCommandOwner = () =>
+            isActiveCommandScope(commandScopeId, activeCommandScopeIdRef.current);
+        void client
+            .subscribe('mcp://ui_request', (request: McpUiRequest) => {
+                if (
+                    disposed ||
+                    !isCurrentCommandOwner(request) ||
+                    !request?.id ||
+                    handledMcpRequestIds.current.has(request.id)
+                )
+                    return;
+                if (request.kind === 'run_visible_tab') {
+                    if (onConnectionsPage && request.connectionId) {
+                        // Editor readiness replays the unclaimed request after navigation.
+                        navigate(buildEditorRoute(request.connectionId));
+                    }
+                    return;
+                }
+                handledMcpRequestIds.current.add(request.id);
+
+                const respond = async (result: Record<string, unknown>) => {
+                    await client.call('write_mcp_ui_response', {
+                        path: request.responsePath,
+                        content: JSON.stringify(result),
+                    });
+                };
+
+                const processRequest = async () => {
+                    try {
+                        await executeClaimedUiRequest(
+                            () => client.call('claim_mcp_ui_request', {id: request.id}),
+                            async () => {
+                                if (!mountedRef.current)
+                                    throw new Error(
+                                        'The editor closed before accepting the file request',
+                                    );
+                                if (
+                                    request.kind === 'open_files' &&
+                                    request.connectionId &&
+                                    commandScopeId === request.connectionId
+                                ) {
+                                    setExplorerConnectionId(request.connectionId);
+                                }
+                                if (request.kind === 'list_visible_tabs') {
+                                    const connectionId = activeConnectionIdRef.current;
+                                    const visibleTabs = connectionId
+                                        ? tabsRef.current.filter(
+                                              (tab) => tab.connectionId === connectionId,
+                                          )
+                                        : [];
+                                    await respond({
+                                        ok: true,
+                                        activeConnectionId: connectionId,
+                                        activeTabId: connectionId
+                                            ? (activeTabIdsRef.current[connectionId] ?? null)
+                                            : null,
+                                        tabs: visibleTabs.map((tab) => ({
+                                            id: tab.id,
+                                            title: tab.title,
+                                            type: tab.type,
+                                            connectionId: tab.connectionId,
+                                            sourceFilePath: tab.sourceFilePath ?? null,
+                                            dirty: tab.sourceFileDirty === true,
+                                            active:
+                                                tab.id ===
+                                                activeTabIdsRef.current[tab.connectionId],
+                                            error: tab.error ?? null,
+                                            result: tab.result
+                                                ? {
+                                                      columns: tab.result.columns,
+                                                      totalRows:
+                                                          tab.result.pagination?.total_rows ?? null,
+                                                      rows: tab.result.rows.slice(0, 20),
+                                                  }
+                                                : null,
+                                            results: (tab.results ?? []).map((entry) => ({
+                                                query: entry.query,
+                                                error: entry.error || null,
+                                                result: entry.result
+                                                    ? {
+                                                          columns: entry.result.columns,
+                                                          totalRows:
+                                                              entry.result.pagination?.total_rows ??
+                                                              null,
+                                                          rows: entry.result.rows.slice(0, 20),
+                                                      }
+                                                    : null,
+                                            })),
+                                        })),
+                                    });
+                                    return;
+                                }
+
+                                if (request.kind !== 'open_files')
+                                    throw new Error('Unknown MCP UI request');
+                                const opened: {
+                                    path: string;
+                                    sha256: string;
+                                    dirty: boolean;
+                                    connectionId: string;
+                                }[] = [];
+                                const seenPaths = new Set<string>();
+                                let lastOpenedTabId: string | null = null;
+                                let lastOpenedConnectionId: string | null = null;
+                                let routedToSplitPane = false;
+                                let routedOpenHandler: RoutedWorkingFileOpenHandler<
+                                    Awaited<ReturnType<typeof openWorkingFile>>
+                                > | null = null;
+                                for (const path of request.paths) {
+                                    if (seenPaths.has(path)) continue;
+                                    seenPaths.add(path);
+                                    const connectionId = request.connectionId;
+                                    let openResult: Awaited<ReturnType<typeof openWorkingFile>>;
+                                    const currentSplit = resolveRenderedSplitLayout({
+                                        splitView: layoutRef.current.splitView,
+                                        isSplitVisible: layoutRef.current.isSplitVisible,
+                                        pathname: layoutRef.current.pathname,
+                                    });
+                                    const existingRoutedOpenHandler =
+                                        getRoutedWorkingFileOpenHandler(
+                                            routedOpenHandler,
+                                            connectionId,
+                                        );
+                                    if (existingRoutedOpenHandler) {
+                                        openResult = await existingRoutedOpenHandler.open(path);
+                                        routedToSplitPane = true;
+                                    } else if (
+                                        connectionId &&
+                                        !commandScopeId &&
+                                        currentSplit &&
+                                        !currentSplit.connectionIds.includes(connectionId)
+                                    ) {
+                                        const initialExplorerConnectionId =
+                                            layoutRef.current.explorerConnectionId;
+                                        if (isConnectionOpen(connectionId))
+                                            switchConnection(connectionId);
+                                        else await connect(connectionId);
+                                        if (
+                                            layoutRef.current.explorerConnectionId !==
+                                            initialExplorerConnectionId
+                                        ) {
+                                            throw new Error(
+                                                'The selected connection changed while the file was loading',
+                                            );
+                                        }
+                                        if (currentSplit.connectionIds.length >= 4) {
+                                            hideSplitView();
+                                            setExplorerConnectionId(connectionId);
+                                            navigate(buildEditorRoute(connectionId));
+                                            openResult = await openWorkingFile(path, connectionId);
+                                        } else {
+                                            addConnectionToSplit(connectionId);
+                                            setExplorerConnectionId(connectionId);
+                                            navigate(BROWSER_ROUTES.editor);
+                                            const targetOpenHandler =
+                                                await waitForWorkingFileOpenHandler(connectionId);
+                                            if (
+                                                layoutRef.current.explorerConnectionId !==
+                                                connectionId
+                                            ) {
+                                                throw new Error(
+                                                    'The selected connection changed before the file opened',
+                                                );
+                                            }
+                                            routedOpenHandler = {
+                                                connectionId,
+                                                open: targetOpenHandler,
+                                            };
+                                            openResult = await routedOpenHandler.open(path);
+                                            routedToSplitPane = true;
+                                        }
+                                    } else {
+                                        openResult = await openWorkingFile(path, connectionId);
+                                    }
+                                    const tab = routedToSplitPane
+                                        ? undefined
+                                        : tabsRef.current.find(
+                                              (entry) => entry.id === openResult.tabId,
+                                          );
+                                    if (
+                                        !routedToSplitPane &&
+                                        (!tab ||
+                                            tab.connectionId !==
+                                                (connectionId ?? activeConnectionIdRef.current))
+                                    ) {
+                                        throw new Error(
+                                            `Could not confirm ${getSqlFileName(path)} in the editor`,
+                                        );
+                                    }
+                                    lastOpenedTabId = openResult.tabId;
+                                    lastOpenedConnectionId = openResult.connectionId;
+                                    opened.push({
+                                        path,
+                                        sha256:
+                                            openResult.sha256 ?? (await sha256(openResult.content)),
+                                        dirty: openResult.dirty,
+                                        connectionId: openResult.connectionId,
+                                    });
+                                }
+                                if (
+                                    !routedToSplitPane &&
+                                    lastOpenedConnectionId &&
+                                    (activeConnectionIdRef.current !== lastOpenedConnectionId ||
+                                        activeTabIdsRef.current[lastOpenedConnectionId] !==
+                                            lastOpenedTabId)
+                                ) {
+                                    throw new Error(
+                                        'The active connection or editor tab changed before the file request completed',
+                                    );
+                                }
+                                await respond({
+                                    ok: true,
+                                    activeConnectionId:
+                                        lastOpenedConnectionId ?? activeConnectionIdRef.current,
+                                    activeTabId: lastOpenedTabId,
+                                    files: opened,
+                                });
+                            },
+                        );
+                    } catch (error) {
+                        try {
+                            await respond({ok: false, error: String(error)});
+                        } catch {
+                            // The MCP caller will time out if the acknowledgement cannot be written.
+                        }
+                    } finally {
+                        handledMcpRequestIds.current.delete(request.id);
+                    }
+                };
+                if (request.kind === 'open_files') {
+                    void enqueueWorkingFileOpen(openFilesQueueRef, processRequest);
+                } else {
+                    void processRequest();
+                }
+            })
+            .then(async (stop) => {
+                if (disposed) {
+                    stop();
+                    return;
+                }
+                unlisten = stop;
+                if (isActiveCommandOwner()) {
+                    markOpenRequestListenerReady.current();
+                    try {
+                        await client.call('mcp_ui_ready', {kind: 'open_files', ready: true});
+                        openReadyAdvertised = true;
+                        if (!disposed && onConnectionsPage) {
+                            await client.call('mcp_ui_ready', {kind: 'run_visible_tab', ready: true});
+                        }
+                    } catch {
+                        // Browser transports do not expose the desktop request watcher.
+                    }
+                }
+            });
+        return () => {
+            disposed = true;
+            unlisten?.();
+            if (onConnectionsPage) {
+                void client.call('mcp_ui_ready', {kind: 'run_visible_tab', ready: false}).catch(() => {});
+            }
+            if (openReadyAdvertised) {
+                void client
+                    .call('mcp_ui_ready', {kind: 'open_files', ready: false})
+                    .catch(() => {});
+            }
+        };
+    }, [
+        activeConnectionId,
+        addConnectionToSplit,
+        client,
+        openWorkingFile,
+        commandScopeId,
+        explorerConnectionId,
+        hideSplitView,
+        isSplitVisible,
+        navigate,
+        setExplorerConnectionId,
+        splitView,
+        location.pathname,
+    ]);
 
     // Open (or focus) a notebook tab, possibly belonging to another connection.
     // For the active connection it resolves immediately; otherwise it records the
@@ -602,6 +1238,12 @@ export const EditorProvider = ({children}: {children: ReactNode}) => {
     const contextValue = useMemo(
         () => ({
             tabs: connectionTabs,
+            recentWorkingFiles,
+            openWorkingFile,
+            clearRecentWorkingFiles,
+            waitForMcpOpenRequestListener,
+            waitForMcpRunRequestListener,
+            markMcpRunRequestListenerReady,
             activeTabId,
             activeTab,
             addTab,
@@ -624,6 +1266,12 @@ export const EditorProvider = ({children}: {children: ReactNode}) => {
         }),
         [
             connectionTabs,
+            recentWorkingFiles,
+            openWorkingFile,
+            clearRecentWorkingFiles,
+            waitForMcpOpenRequestListener,
+            waitForMcpRunRequestListener,
+            markMcpRunRequestListenerReady,
             activeTabId,
             activeTab,
             addTab,

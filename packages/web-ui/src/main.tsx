@@ -11,7 +11,6 @@ import {ToastProvider} from '@/contexts/ToastProvider';
 import {SettingsProvider} from '@/contexts/SettingsProvider';
 import {SavedQueriesProvider} from '@/contexts/SavedQueriesProvider';
 import {QueryHistoryProvider} from '@/contexts/QueryHistoryProvider';
-import {EditorProvider} from '@/contexts/EditorProvider';
 import {ThemeProvider} from '@/contexts/ThemeProvider';
 import {UpdateProvider} from '@/contexts/UpdateProvider';
 import {ProductionGuardProvider} from '@/contexts/ProductionGuardContext';
@@ -56,11 +55,9 @@ async function startApplication() {
                                             <DatabaseProvider>
                                                 <SavedQueriesProvider>
                                                     <QueryHistoryProvider>
-                                                        <EditorProvider>
-                                                            <ProductionGuardProvider>
-                                                                <App />
-                                                            </ProductionGuardProvider>
-                                                        </EditorProvider>
+                                                        <ProductionGuardProvider>
+                                                            <App />
+                                                        </ProductionGuardProvider>
                                                     </QueryHistoryProvider>
                                                 </SavedQueriesProvider>
                                             </DatabaseProvider>

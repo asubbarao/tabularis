@@ -337,4 +337,23 @@ describe('queryParameters', () => {
             expect(interpolateQueryParams("SELECT ':id', :id", {id: '9'})).toBe("SELECT '9', 9");
         });
     });
+
+    describe('DuckDB struct keys', () => {
+        it('does not treat a colon after a quoted struct key as a bind parameter', () => {
+            const sql = "SELECT {'command':check_command.command}";
+            expect(extractQueryParams(sql, 'duckdb')).toEqual([]);
+            expect(
+                interpolateQueryParams(sql, {check_command: 'SELECT 1'}, 'duckdb'),
+            ).toBe(sql);
+        });
+
+        it('still finds real parameters and ignores dollar-quoted contents', () => {
+            expect(extractQueryParams('SELECT :check_command', 'duckdb')).toEqual([
+                'check_command',
+            ]);
+            expect(
+                extractQueryParams('SELECT $$ :hidden; $$, :visible', 'postgres'),
+            ).toEqual(['visible']);
+        });
+    });
 });
