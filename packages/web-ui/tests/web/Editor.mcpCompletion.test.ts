@@ -39,6 +39,16 @@ describe('getCommittedVisibleResults', () => {
         expect(dispatched).toBe(false);
     });
 
+    it('runs the scratch query only after it is detached from the SQL TV file', () => {
+        const path = '/home/user/.duck/tabularis/codex-682a7352ac15.sql';
+        let executions = 0;
+        const run = () => ++executions;
+        expect(
+            executeSqlSourceAction({sourceFileKind: 'sql', sourceFilePath: path}, run),
+        ).toBeUndefined();
+        expect(executeSqlSourceAction({}, run)).toBe(1);
+    });
+
     it('does not accept the previous result objects', () => {
         const oldEntry = {id: 'r0', isLoading: false, result: {rows: [[1]]}, error: ''};
 

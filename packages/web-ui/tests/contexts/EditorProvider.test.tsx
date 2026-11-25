@@ -1,10 +1,13 @@
 import {describe, it, expect, vi, beforeEach, afterEach} from 'vitest';
 import {renderHook, waitFor, act} from '@testing-library/react';
+import {MemoryRouter} from 'react-router-dom';
+import {ConnectionLayoutProvider} from '@/contexts/ConnectionLayoutProvider';
 import {EditorProvider} from '@/contexts/EditorProvider';
 import {useEditor} from '@/hooks/useEditor';
 import {useResultChartState} from '@/hooks/useResultChartState';
 import {buildDuplicatedTab} from '@/utils/editor';
 import {getAdjacentTabGap} from '@/utils/tabDnd';
+import {createSqlFileTab} from '@/utils/sqlFile';
 import {DatabaseContext} from '@/contexts/DatabaseContext';
 import {invoke} from '@tauri-apps/api/core';
 import React from 'react';
@@ -16,6 +19,21 @@ import {TauriTransport} from '@/api/transports/tauriTransport';
 vi.mock('@tauri-apps/api/core', () => ({
     invoke: vi.fn(),
 }));
+
+vi.mock('@tauri-apps/api/event', () => ({
+    emit: vi.fn(async () => undefined),
+    listen: vi.fn(async () => () => undefined),
+}));
+
+function EditorProviderHarness({children}: {children?: React.ReactNode}) {
+    return (
+        <MemoryRouter>
+            <ConnectionLayoutProvider>
+                <EditorProvider>{children}</EditorProvider>
+            </ConnectionLayoutProvider>
+        </MemoryRouter>
+    );
+}
 
 describe('EditorProvider', () => {
     const localStorageMock = {
@@ -78,7 +96,7 @@ describe('EditorProvider', () => {
                             refreshTables: vi.fn(),
                         },
                     },
-                    React.createElement(EditorProvider, null, children),
+                    React.createElement(EditorProviderHarness, null, children),
                 ),
             );
     };
@@ -117,6 +135,99 @@ describe('EditorProvider', () => {
         expect(result.current.tabs[0].title).toBe('Console');
         expect(result.current.tabs[0].type).toBe('console');
         expect(result.current.activeTabId).toBe(result.current.tabs[0].id);
+    });
+
+    it('leaves the active scratch editor selected when a SQL TV tab arrives', () => {
+        const {result} = renderHook(() => useEditor(), {wrapper: createWrapper('conn-1')});
+        let scratchId = '';
+        act(() => {
+            scratchId = result.current.addTab({type: 'console', query: 'SELECT 1'});
+        });
+        act(() => {
+            result.current.addTab(
+                createSqlFileTab('/home/user/.duck/tabularis/codex-123abc123abc.sql', 'SELECT 2'),
+                {activate: false},
+            );
+        });
+
+        expect(result.current.activeTabId).toBe(scratchId);
+        expect(result.current.activeTab?.query).toBe('SELECT 1');
+        expect(result.current.tabs[1]).toMatchObject({query: 'SELECT 2', readOnly: true});
+    });
+
+    it('refreshes the selected monitor from disk without reopening it', async () => {
+        const path = '/home/user/.duck/tabularis/Active agent sessions.md';
+        vi.mocked(invoke).mockImplementation(async (command) => {
+            if (command === 'read_sql_file') return '# Current sessions';
+            return null;
+        });
+        const {result} = renderHook(() => useEditor(), {wrapper: createWrapper('conn-1')});
+        await waitFor(() => expect(result.current.activeTab).not.toBeNull());
+        let monitorId = '';
+        act(() => {
+            monitorId = result.current.addTab(createSqlFileTab(path, '# Previous sessions'));
+        });
+
+        await waitFor(() => expect(result.current.activeTab?.query).toBe('# Current sessions'));
+        expect(result.current.activeTabId).toBe(monitorId);
+        expect(result.current.tabs).toHaveLength(2);
+        expect(result.current.activeTab?.sourceFileDirty).toBe(false);
+    });
+
+    it('keeps unsaved text when a disk refresh returns', async () => {
+        const path = '/home/user/.duck/tabularis/codex-123abc123abc.sql';
+        let finishRead!: (text: string) => void;
+        const pendingRead = new Promise<string>((resolve) => {
+            finishRead = resolve;
+        });
+        vi.mocked(invoke).mockImplementation(async (command) => {
+            if (command === 'read_sql_file') return pendingRead;
+            return null;
+        });
+        const {result} = renderHook(() => useEditor(), {wrapper: createWrapper('conn-1')});
+        await waitFor(() => expect(result.current.activeTab).not.toBeNull());
+        let tabId = '';
+        act(() => {
+            tabId = result.current.addTab(createSqlFileTab(path, 'SELECT 1'));
+        });
+        act(() => {
+            result.current.updateTab(tabId, {query: 'SELECT 2', sourceFileDirty: true});
+        });
+        await act(async () => finishRead('SELECT 3'));
+
+        expect(result.current.activeTab).toMatchObject({query: 'SELECT 2', sourceFileDirty: true});
+    });
+
+    it('restores unsaved working file text from persisted preferences after remounting', async () => {
+        const path = '/home/user/working.sql';
+        let savedPreferences: unknown;
+        vi.mocked(invoke).mockImplementation(async (command, args) => {
+            if (command === 'save_editor_preferences' && args && 'preferences' in args) {
+                savedPreferences = JSON.parse(JSON.stringify(args.preferences));
+            }
+            if (command === 'load_editor_preferences') return savedPreferences;
+            return null;
+        });
+        const {result, unmount} = renderHook(() => useEditor(), {wrapper: createWrapper('conn-1')});
+        await waitFor(() => expect(result.current.activeTab).not.toBeNull());
+        const expected = {
+            query: 'SELECT unsaved',
+            sourceFileContent: 'SELECT saved',
+            sourceFilePath: path,
+            sourceFileDirty: true,
+        };
+        act(() => {
+            result.current.addTab({...createSqlFileTab(path, 'SELECT saved'), ...expected});
+        });
+        await waitFor(() =>
+            expect(savedPreferences).toMatchObject({
+                tabs: expect.arrayContaining([expect.objectContaining(expected)]),
+            }),
+        );
+        unmount();
+
+        const restored = renderHook(() => useEditor(), {wrapper: createWrapper('conn-1')});
+        await waitFor(() => expect(restored.result.current.activeTab).toMatchObject(expected));
     });
 
     it('should add multiple console tabs with numbered titles', () => {
@@ -985,7 +1096,7 @@ describe('EditorProvider pinned tabs in storage (#1304)', () => {
                             refreshTables: vi.fn(),
                         },
                     },
-                    React.createElement(EditorProvider, null, children),
+                    React.createElement(EditorProviderHarness, null, children),
                 ),
             );
         const {result} = renderHook(() => useEditor(), {wrapper});
@@ -1072,7 +1183,7 @@ describe('EditorProvider connection switching (#292)', () => {
                             refreshTables: vi.fn(),
                         },
                     },
-                    React.createElement(EditorProvider, null, children),
+                    React.createElement(EditorProviderHarness, null, children),
                 ),
             );
 
@@ -1165,7 +1276,7 @@ describe('EditorProvider reopen closed tab across connections (#866)', () => {
                 React.createElement(
                     TabularisClientProvider,
                     {client},
-                    React.createElement(EditorProvider, null, children),
+                    React.createElement(EditorProviderHarness, null, children),
                 ),
             );
 

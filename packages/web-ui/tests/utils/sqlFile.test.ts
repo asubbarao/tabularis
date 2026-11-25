@@ -1,5 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
+    buildSqlTvFeedback,
+    buildSqlTvScratch,
     createSqlFileTab,
     getSourceFileKind,
     getSourceFileLanguage,
@@ -11,6 +13,32 @@ import {
 } from '@/utils/sqlFile';
 
 describe('sqlFile', () => {
+    it('opens only the current statement in scratch when there is no selection', () => {
+        expect(
+            buildSqlTvScratch(
+                '-- claude session 123\n-- branch main | cwd /work\n' +
+                    '-- SQL TV call one\n-- cwd /work | transcript 1 → 2\n' +
+                    'SELECT 2;\n-- Recorded tool result: [2]\n' +
+                    '-- SQL TV call two\n-- cwd /work | transcript 3 → 4\n' +
+                    'SELECT 1;\n-- Recorded tool result: [1]\n',
+                9,
+            ),
+        ).toBe('SELECT 1;');
+    });
+    it('copies the statement and observed result at the cursor with the source session', () => {
+        expect(
+            buildSqlTvFeedback(
+                '-- claude session 123\n-- branch main | cwd /work\n' +
+                    '-- SQL TV call one\nSELECT 2;\n-- observed rows: [2]\n' +
+                    '-- SQL TV call two\nSELECT 1;\n-- observed rows: [1]\n',
+                8,
+            ),
+        ).toBe(
+            '-- claude session 123\n-- branch main | cwd /work\n\n' +
+                '-- SQL TV call two\nSELECT 1;\n-- observed rows: [1]',
+        );
+    });
+
     describe('getSqlFileName', () => {
         it('returns the last segment of Unix and Windows paths', () => {
             expect(getSqlFileName('/home/user/queries/report.sql')).toBe('report.sql');
@@ -23,6 +51,24 @@ describe('sqlFile', () => {
     });
 
     describe('createSqlFileTab', () => {
+        it('creates passive SQL TV tabs without changing regular SQL files', () => {
+            const path = '/home/user/.duck/tabularis/claude-6b62258612e1.sql';
+            expect(createSqlFileTab(path, 'SELECT 1;')).toMatchObject({
+                title: 'SQL TV · claude-6b62258612e1',
+                query: 'SELECT 1;',
+                readOnly: true,
+                sourceFilePath: path,
+                sourceFileDirty: false,
+            });
+            expect(
+                createSqlFileTab('/work/claude-6b62258612e1.sql', 'SELECT 1;').readOnly,
+            ).toBeUndefined();
+            expect(
+                createSqlFileTab('/home/user/.duck/tabularis/claude-issue-seed01.sql', 'SELECT 1;')
+                    .readOnly,
+            ).toBeUndefined();
+        });
+
         it('creates a console tab named after a Unix file path', () => {
             expect(createSqlFileTab('/tmp/report.sql', 'SELECT 1;')).toEqual({
                 type: 'console',

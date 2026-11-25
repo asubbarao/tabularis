@@ -6,12 +6,18 @@ export interface OpenedWorkingFile {
     sha256?: string;
 }
 
-export type WorkingFileOpenHandler = (path: string) => Promise<OpenedWorkingFile>;
+export type WorkingFileOpenHandler = (
+    path: string,
+    background?: boolean,
+) => Promise<OpenedWorkingFile>;
 
 const handlers = new Map<string, WorkingFileOpenHandler>();
 const handlerWaiters = new Map<string, Set<() => void>>();
 
-export function registerWorkingFileOpenHandler(scopeId: string, handler: WorkingFileOpenHandler): () => void {
+export function registerWorkingFileOpenHandler(
+    scopeId: string,
+    handler: WorkingFileOpenHandler,
+): () => void {
     handlers.set(scopeId, handler);
     handlerWaiters.get(scopeId)?.forEach((resolve) => resolve());
     handlerWaiters.delete(scopeId);

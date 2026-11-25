@@ -1775,6 +1775,12 @@
     "auto": "Auto"
   },
   "editor": {
+    "sqlTv": {
+      "copyFeedback": "Copy feedback context",
+      "copied": "SQL TV context copied",
+      "openScratch": "Open scratch copy",
+      "scratchTitle": "SQL TV scratch"
+    },
     "recentWorkingFiles": {
       "title": "Recent files",
       "clear": "Clear history",
