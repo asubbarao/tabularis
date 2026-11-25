@@ -25,6 +25,9 @@ export function assertVisibleRequestCurrent(
 }
 
 export function isSqlSourceTab(tab: object): boolean {
+    if ('sourceFilePath' in tab && typeof tab.sourceFilePath === 'string') {
+        if (getSqlTvSession(tab.sourceFilePath)) return false;
+    }
     const kind =
         'sourceFileKind' in tab ? (tab as {sourceFileKind?: unknown}).sourceFileKind : undefined;
     return kind === undefined || kind === 'sql';
@@ -78,3 +81,4 @@ export async function executeVisiblePreflight<T>(
     assertCurrent();
     return execute();
 }
+import {getSqlTvSession} from './sqlFile';

@@ -37,7 +37,7 @@ export function isWorkingFileOpenCurrent(
 
 export interface RoutedWorkingFileOpenHandler<T> {
     connectionId: string;
-    open: (path: string) => Promise<T>;
+    open: (path: string, background?: boolean) => Promise<T>;
 }
 
 export function getRoutedWorkingFileOpenHandler<T>(
@@ -51,6 +51,7 @@ export function reloadCleanWorkingFileBuffer<
     T extends {query?: string; sourceFileContent?: string; sourceFileDirty?: boolean},
 >(tab: T, savedContent: string): T {
     if (tab.sourceFileDirty) return tab;
+    if (tab.query === savedContent && tab.sourceFileContent === savedContent) return tab;
     return {...tab, query: savedContent, sourceFileContent: savedContent, sourceFileDirty: false};
 }
 

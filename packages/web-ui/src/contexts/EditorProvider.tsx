@@ -38,7 +38,13 @@ import {
     type ClosedTabsByConnection,
 } from '@/utils/closedTabs';
 import {createNotebookFromState, evictFromCache, flushAllPendingSaves} from '@/utils/notebookStore';
-import {createSqlFileTab, getSourceFileKind, getSqlFileName} from '@/utils/sqlFile';
+import {
+    createSqlFileTab,
+    getSourceFileKind,
+    getSqlFileName,
+    getSqlTvSession,
+    isSqlTvPath,
+} from '@/utils/sqlFile';
 import {UI_STATE_KEYS} from '@/utils/uiStateStore';
 import {useUiState} from '@/hooks/useUiState';
 import {
@@ -211,13 +217,12 @@ export const EditorProvider = ({
     const waitForMcpRunRequestListener = useCallback(() => {
         if (runRequestListenerReady.current) return Promise.resolve();
         return new Promise<void>((resolve, reject) => {
-            let timeout: number;
             const ready = () => {
                 window.clearTimeout(timeout);
                 runRequestListenerWaiters.current.delete(ready);
                 resolve();
             };
-            timeout = window.setTimeout(() => {
+            const timeout = window.setTimeout(() => {
                 runRequestListenerWaiters.current.delete(ready);
                 reject(new Error('The editor did not become ready to display the file'));
             }, 20_000);
@@ -319,6 +324,11 @@ export const EditorProvider = ({
                         tab.sourceFileKind = getSourceFileKind(tab.sourceFilePath);
                         if (tab.sourceFileKind !== 'sql') tab.readOnly = true;
                     }
+                    const sqlTvSession = getSqlTvSession(tab.sourceFilePath);
+                    if (sqlTvSession) {
+                        tab.readOnly = true;
+                        tab.title = `SQL TV · ${sqlTvSession}`;
+                    }
                 }
 
                 // Migrate old notebook tabs: notebookState → notebookId
@@ -418,6 +428,37 @@ export const EditorProvider = ({
 
     const activeTabId = activeConnectionId ? activeTabIds[activeConnectionId] || null : null;
 
+    useEffect(() => {
+        const sourcePath = tabsRef.current.find((tab) => tab.id === activeTabId)?.sourceFilePath;
+        if (!sourcePath || !isSqlTvPath(sourcePath)) return;
+
+        let stopped = false;
+        let timer: number | undefined;
+        const refresh = async () => {
+            try {
+                const content = await client.call('read_sql_file', {path: sourcePath});
+                if (stopped) return;
+                setTabs((previous) => {
+                    const current = previous.find((tab) => tab.id === activeTabId);
+                    if (current?.sourceFilePath !== sourcePath) return previous;
+                    const updated = reloadCleanWorkingFileBuffer(current, content);
+                    return updated === current
+                        ? previous
+                        : previous.map((tab) => (tab.id === activeTabId ? updated : tab));
+                });
+            } catch {
+                // The producer may be unavailable. Keep the last visible snapshot.
+            } finally {
+                if (!stopped) timer = window.setTimeout(refresh, 5_000);
+            }
+        };
+        void refresh();
+        return () => {
+            stopped = true;
+            window.clearTimeout(timer);
+        };
+    }, [activeTabId, client]);
+
     const setActiveTabId = useCallback(
         (id: string, options?: {preview?: boolean}) => {
             if (activeConnectionId && id) {
@@ -456,7 +497,7 @@ export const EditorProvider = ({
                     partial?.database,
                 );
                 if (existing) {
-                    setActiveTabId(existing.id);
+                    if (options?.activate !== false) setActiveTabId(existing.id);
                     return existing.id;
                 }
             }
@@ -478,7 +519,7 @@ export const EditorProvider = ({
                     activeConnectionId,
                 );
             });
-            setActiveTabId(id);
+            if (options?.activate !== false) setActiveTabId(id);
             return id;
         },
         [createInitialTab, activeConnectionId, setActiveTabId],
@@ -497,6 +538,7 @@ export const EditorProvider = ({
         async (
             filePath: string,
             targetConnectionId?: string,
+            background = false,
         ): Promise<{
             tabId: string;
             content: string;
@@ -564,14 +606,14 @@ export const EditorProvider = ({
             await waitForMcpRunRequestListener();
             assertOpenCurrent();
             const startingActiveTabId = activeTabIdsRef.current[connectionId] ?? null;
+            const activate = !background || !startingActiveTabId;
+            const activeTabChanged = () =>
+                activate && activeTabIdsRef.current[connectionId] !== startingActiveTabId;
 
             const sourceFileKind = getSourceFileKind(filePath);
             const content = await client.call('read_sql_file', {path: filePath});
             assertOpenCurrent();
-            if (
-                activeConnectionIdRef.current !== connectionId ||
-                activeTabIdsRef.current[connectionId] !== startingActiveTabId
-            ) {
+            if (activeConnectionIdRef.current !== connectionId || activeTabChanged()) {
                 throw new Error(
                     'The active connection or editor tab changed while the file was loading',
                 );
@@ -591,29 +633,22 @@ export const EditorProvider = ({
                         ),
                     );
                 }
-                if (
-                    activeConnectionIdRef.current !== connectionId ||
-                    activeTabIdsRef.current[connectionId] !== startingActiveTabId
-                ) {
+                if (activeConnectionIdRef.current !== connectionId || activeTabChanged()) {
                     throw new Error(
                         'The active connection or editor tab changed while the file was loading',
                     );
                 }
-                setActiveTabIdRef.current(existing.id);
+                if (activate) setActiveTabIdRef.current(existing.id);
             } else {
-                if (
-                    activeConnectionIdRef.current !== connectionId ||
-                    activeTabIdsRef.current[connectionId] !== startingActiveTabId
-                ) {
+                if (activeConnectionIdRef.current !== connectionId || activeTabChanged()) {
                     throw new Error(
                         'The active connection or editor tab changed while the file was loading',
                     );
                 }
-                tabId = addTabRef.current({
-                    ...createSqlFileTab(filePath, content),
-                    connectionId,
-                    sourceFileKind,
-                });
+                tabId = addTabRef.current(
+                    {...createSqlFileTab(filePath, content), connectionId, sourceFileKind},
+                    {activate},
+                );
             }
 
             const deadline = Date.now() + 10_000;
@@ -624,7 +659,9 @@ export const EditorProvider = ({
                 const currentActiveTabId = activeTabIdsRef.current[connectionId] ?? null;
                 if (
                     activeConnectionIdRef.current !== connectionId ||
-                    (currentActiveTabId !== startingActiveTabId && currentActiveTabId !== tabId)
+                    (activate &&
+                        currentActiveTabId !== startingActiveTabId &&
+                        currentActiveTabId !== tabId)
                 ) {
                     throw new Error(
                         'The active connection or editor tab changed while the file was opening',
@@ -632,7 +669,7 @@ export const EditorProvider = ({
                 }
                 if (
                     committedTab &&
-                    isActive &&
+                    (!activate || isActive) &&
                     isWorkingFileBufferReady(committedTab, filePath, sourceFileKind, content)
                 ) {
                     const currentContent = committedTab.query;
@@ -671,8 +708,8 @@ export const EditorProvider = ({
 
     useEffect(() => {
         if (!commandScopeId) return;
-        return registerWorkingFileOpenHandler(commandScopeId, (path) =>
-            openWorkingFile(path, commandScopeId),
+        return registerWorkingFileOpenHandler(commandScopeId, (path, background) =>
+            openWorkingFile(path, commandScopeId, background),
         );
     }, [commandScopeId, openWorkingFile]);
 
@@ -808,6 +845,7 @@ export const EditorProvider = ({
                                     if (seenPaths.has(path)) continue;
                                     seenPaths.add(path);
                                     const connectionId = request.connectionId;
+                                    const background = isSqlTvPath(path);
                                     let openResult: Awaited<ReturnType<typeof openWorkingFile>>;
                                     const currentSplit = resolveRenderedSplitLayout({
                                         splitView: layoutRef.current.splitView,
@@ -820,7 +858,10 @@ export const EditorProvider = ({
                                             connectionId,
                                         );
                                     if (existingRoutedOpenHandler) {
-                                        openResult = await existingRoutedOpenHandler.open(path);
+                                        openResult = await existingRoutedOpenHandler.open(
+                                            path,
+                                            background,
+                                        );
                                         routedToSplitPane = true;
                                     } else if (
                                         connectionId &&
@@ -845,7 +886,11 @@ export const EditorProvider = ({
                                             hideSplitView();
                                             setExplorerConnectionId(connectionId);
                                             navigate(buildEditorRoute(connectionId));
-                                            openResult = await openWorkingFile(path, connectionId);
+                                            openResult = await openWorkingFile(
+                                                path,
+                                                connectionId,
+                                                background,
+                                            );
                                         } else {
                                             addConnectionToSplit(connectionId);
                                             setExplorerConnectionId(connectionId);
@@ -864,11 +909,18 @@ export const EditorProvider = ({
                                                 connectionId,
                                                 open: targetOpenHandler,
                                             };
-                                            openResult = await routedOpenHandler.open(path);
+                                            openResult = await routedOpenHandler.open(
+                                                path,
+                                                background,
+                                            );
                                             routedToSplitPane = true;
                                         }
                                     } else {
-                                        openResult = await openWorkingFile(path, connectionId);
+                                        openResult = await openWorkingFile(
+                                            path,
+                                            connectionId,
+                                            background,
+                                        );
                                     }
                                     const tab = routedToSplitPane
                                         ? undefined
@@ -885,8 +937,10 @@ export const EditorProvider = ({
                                             `Could not confirm ${getSqlFileName(path)} in the editor`,
                                         );
                                     }
-                                    lastOpenedTabId = openResult.tabId;
-                                    lastOpenedConnectionId = openResult.connectionId;
+                                    if (!background) {
+                                        lastOpenedTabId = openResult.tabId;
+                                        lastOpenedConnectionId = openResult.connectionId;
+                                    }
                                     opened.push({
                                         path,
                                         sha256:
@@ -910,7 +964,12 @@ export const EditorProvider = ({
                                     ok: true,
                                     activeConnectionId:
                                         lastOpenedConnectionId ?? activeConnectionIdRef.current,
-                                    activeTabId: lastOpenedTabId,
+                                    activeTabId:
+                                        lastOpenedTabId ??
+                                        activeTabIdsRef.current[
+                                            activeConnectionIdRef.current ?? ''
+                                        ] ??
+                                        null,
                                     files: opened,
                                 });
                             },
@@ -943,7 +1002,10 @@ export const EditorProvider = ({
                         await client.call('mcp_ui_ready', {kind: 'open_files', ready: true});
                         openReadyAdvertised = true;
                         if (!disposed && onConnectionsPage) {
-                            await client.call('mcp_ui_ready', {kind: 'run_visible_tab', ready: true});
+                            await client.call('mcp_ui_ready', {
+                                kind: 'run_visible_tab',
+                                ready: true,
+                            });
                         }
                     } catch {
                         // Browser transports do not expose the desktop request watcher.
@@ -954,7 +1016,9 @@ export const EditorProvider = ({
             disposed = true;
             unlisten?.();
             if (onConnectionsPage) {
-                void client.call('mcp_ui_ready', {kind: 'run_visible_tab', ready: false}).catch(() => {});
+                void client
+                    .call('mcp_ui_ready', {kind: 'run_visible_tab', ready: false})
+                    .catch(() => {});
             }
             if (openReadyAdvertised) {
                 void client

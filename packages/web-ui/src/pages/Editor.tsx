@@ -233,7 +233,14 @@ import type {
     EditorNavigationIntent,
     EditorNavigationRequest,
 } from '@/types/editor';
-import {getSourceFileKind, getSourceFileLanguage} from '@/utils/sqlFile';
+import {
+    buildSqlTvFeedback,
+    buildSqlTvScratch,
+    getSourceFileKind,
+    getSourceFileLanguage,
+    getSqlTvSession,
+    isSqlTvPath,
+} from '@/utils/sqlFile';
 import {RecentWorkingFiles} from '@/components/editor/RecentWorkingFiles';
 import {createEditorNavigationIntent, parseEditorNavigationIntent} from '@/utils/editorNavigation';
 import {CommandPaletteScopeBridge} from '@/components/layout/CommandPaletteScopeBridge';
@@ -401,8 +408,11 @@ export const Editor = ({commandScopeId}: EditorProps) => {
     const navigate = useNavigate();
 
     const driverReadonly = isReadonly(activeCapabilities);
+    const sqlTvSession = getSqlTvSession(activeTab?.sourceFilePath);
+    const isSqlTv = activeTab?.sourceFilePath ? isSqlTvPath(activeTab.sourceFilePath) : false;
     const canUseQueryParameters =
-        !activeTab?.sourceFilePath || getSourceFileKind(activeTab.sourceFilePath) === 'sql';
+        !sqlTvSession &&
+        (!activeTab?.sourceFilePath || getSourceFileKind(activeTab.sourceFilePath) === 'sql');
     const driverSupportsExplain = supportsExplain(activeCapabilities);
     // The connection's resolved SQL syntax (`sql_dialect` preset plus any
     // declared `sql_syntax`), passed wherever a dialect is needed. Cached per
@@ -785,12 +795,15 @@ export const Editor = ({commandScopeId}: EditorProps) => {
     // Save is a no-op on a clean file and on an empty console (which would
     // otherwise open a Save As dialog for nothing).
     const canSaveSqlFile = useCallback(
-        (tab: Tab) => (tab.sourceFilePath ? tab.sourceFileDirty === true : !!tab.query?.trim()),
+        (tab: Tab) =>
+            (!tab.sourceFilePath || !isSqlTvPath(tab.sourceFilePath)) &&
+            (tab.sourceFilePath ? tab.sourceFileDirty === true : !!tab.query?.trim()),
         [],
     );
 
     const handleSaveSqlFile = useCallback(
         async (tab: Tab, saveAs = false) => {
+            if (tab.sourceFilePath && isSqlTvPath(tab.sourceFilePath)) return;
             try {
                 const savedQuery = tab.query;
                 const saved = await saveSqlFile(platform, client, {
@@ -5122,6 +5135,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
         if (mountedTab?.type === 'console' && tabId === activeTabIdRef.current) {
             editor.focus();
         }
+        if (mountedTab?.sourceFilePath && isSqlTvPath(mountedTab.sourceFilePath)) return;
         editor.addAction({
             id: 'run-selection',
             label: 'Execute Selection',
@@ -5914,6 +5928,60 @@ export const Editor = ({commandScopeId}: EditorProps) => {
           below later siblings. */}
             {!isNotebookTab && !isUsersTab && (
                 <div className="@container relative z-40 flex items-center py-2 pl-2 pr-3 border-b border-default bg-elevated gap-1.5 @[560px]:gap-2 h-[50px]">
+                    {isSqlTv && (
+                        <button
+                            type="button"
+                            className="shrink-0 rounded border border-strong bg-surface-secondary px-3 py-1.5 text-sm font-medium text-primary hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+                            onClick={() => {
+                                const editor = editorsRef.current[activeTab.id];
+                                const content = editor?.getValue() ?? activeTab.query;
+                                const feedback = sqlTvSession
+                                    ? buildSqlTvFeedback(
+                                          content,
+                                          editor?.getPosition()?.lineNumber ?? 1,
+                                      )
+                                    : content;
+                                void copyTextToClipboard(feedback)
+                                    .then(() =>
+                                        showToast(t('editor.sqlTv.copied'), {kind: 'success'}),
+                                    )
+                                    .catch((error: unknown) =>
+                                        showAlert(toErrorMessage(error), {kind: 'error'}),
+                                    );
+                            }}
+                        >
+                            {t('editor.sqlTv.copyFeedback')}
+                        </button>
+                    )}
+                    {sqlTvSession && (
+                        <button
+                            type="button"
+                            className="shrink-0 rounded border border-strong bg-surface-secondary px-3 py-1.5 text-sm font-medium text-primary hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+                            onClick={() => {
+                                const editor = editorsRef.current[activeTab.id];
+                                const selection = editor?.getSelection();
+                                const selectedText = selection
+                                    ? editor?.getModel()?.getValueInRange(selection)
+                                    : undefined;
+                                addTab(
+                                    {
+                                        type: 'console',
+                                        title: t('editor.sqlTv.scratchTitle'),
+                                        query: buildSqlTvScratch(
+                                            editor?.getValue() ?? activeTab.query,
+                                            editor?.getPosition()?.lineNumber ?? 1,
+                                            selectedText,
+                                        ),
+                                        schema: activeTab.schema,
+                                        database: activeTab.database,
+                                    },
+                                    {forceNew: true, insertAfterId: activeTab.id},
+                                );
+                            }}
+                        >
+                            {t('editor.sqlTv.openScratch')}
+                        </button>
+                    )}
                     {!activeTab.readOnly && activeTab.isLoading ? (
                         <button
                             onClick={stopQuery}
@@ -6033,7 +6101,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                     )}
 
                     {/* Format SQL Button */}
-                    {!isTableTab && (
+                    {!isTableTab && !isSqlTv && (
                         <button
                             onClick={() => {
                                 const editor = editorsRef.current[activeTab.id];
@@ -6055,7 +6123,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                     {/* Save split button: main action saves the SQL file (or asks for a
             path on a console that has none), the chevron opens the other
             save destinations. */}
-                    {!isTableTab && activeTab.type === 'console' && (
+                    {!isTableTab && !isSqlTv && activeTab.type === 'console' && (
                         <div ref={saveMenuRef} className="relative shrink-0">
                             <div className="flex items-center rounded border border-strong bg-surface-secondary text-sm font-medium">
                                 <button
@@ -6364,6 +6432,8 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                                 cursorStatus
                                 diagnostics={isActive ? sqlDiagnostics : undefined}
                                 onChange={(val) => {
+                                    if (tab.sourceFilePath && isSqlTvPath(tab.sourceFilePath))
+                                        return;
                                     // Debounced Monaco edits can arrive after this tab becomes
                                     // inactive. The callback belongs to the tab's stable id;
                                     // dropping it would lose the user's latest SQL on switch.
@@ -6383,6 +6453,9 @@ export const Editor = ({commandScopeId}: EditorProps) => {
                                 editorKey={tab.id}
                                 options={{
                                     padding: {top: 16, bottom: 40},
+                                    readOnly: Boolean(
+                                        tab.sourceFilePath && isSqlTvPath(tab.sourceFilePath),
+                                    ),
                                 }}
                             />
                         )}

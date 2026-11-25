@@ -3,6 +3,8 @@ import type {Tab, TableSchema, QueryResultEntry} from '@/types/editor';
 import type {AutoRefreshSchedule} from '@/utils/autoRefresh';
 
 export interface AddTabOptions {
+    /** Preserve the active tab when adding a background working file. */
+    activate?: boolean;
     /** Insert the new tab immediately after this id instead of appending it. */
     insertAfterId?: string;
     /**

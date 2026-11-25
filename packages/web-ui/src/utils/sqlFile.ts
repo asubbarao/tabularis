@@ -66,6 +66,45 @@ export function isSqlSourceFile(filePath: string): boolean {
     return SQL_EXTENSIONS.has(extension);
 }
 
+export function getSqlTvSession(filePath?: string): string | undefined {
+    return filePath
+        ?.replaceAll('\\', '/')
+        .match(/(?:^|\/)\.duck\/tabularis\/((?:claude|codex)-[a-f0-9]{12})\.sql$/i)?.[1];
+}
+
+export function isSqlTvPath(filePath: string): boolean {
+    return (
+        Boolean(getSqlTvSession(filePath)) ||
+        filePath.replaceAll('\\', '/').endsWith('/.duck/tabularis/Active agent sessions.md')
+    );
+}
+
+function sqlTvEntryAtCursor(content: string, cursorLine: number): string[] {
+    const lines = content.split('\n');
+    const entries = lines.flatMap((line, index) =>
+        line.startsWith('-- SQL TV call ') ? [index] : [],
+    );
+    const start = entries.filter((index) => index < cursorLine).at(-1) ?? entries[0];
+    if (start === undefined) return [];
+    const end = entries.find((index) => index > start);
+    return lines.slice(start, end);
+}
+
+export function buildSqlTvFeedback(content: string, cursorLine: number): string {
+    const header = content.split('\n', 2).join('\n');
+    const entry = sqlTvEntryAtCursor(content, cursorLine).join('\n').trimEnd();
+    return entry ? `${header}\n\n${entry}` : content;
+}
+
+export function buildSqlTvScratch(content: string, cursorLine: number, selection?: string): string {
+    if (selection) return selection;
+    const entry = sqlTvEntryAtCursor(content, cursorLine);
+    const outcome = entry.findIndex(
+        (line, index) => index > 1 && /^(-- Recorded |-- No result recorded)/.test(line),
+    );
+    return outcome === -1 ? '' : entry.slice(2, outcome).join('\n');
+}
+
 export function getSourceFileKind(filePath: string): 'sql' | 'markdown' | 'text' {
     const extension = filePath.split('.').pop()?.toLowerCase() ?? '';
     if (SQL_EXTENSIONS.has(extension)) return 'sql';
@@ -92,12 +131,13 @@ export function getSavedQueryExportFileName(name?: string | null): string {
 }
 
 export function createSqlFileTab(filePath: string, query: string, schema?: string): Partial<Tab> {
+    const sqlTvSession = getSqlTvSession(filePath);
     return {
         type: 'console',
-        title: getSqlFileName(filePath),
+        title: sqlTvSession ? `SQL TV · ${sqlTvSession}` : getSqlFileName(filePath),
         query,
         sourceFileKind: getSourceFileKind(filePath),
-        ...(!isSqlSourceFile(filePath) ? {readOnly: true} : {}),
+        ...(sqlTvSession || !isSqlSourceFile(filePath) ? {readOnly: true} : {}),
         sourceFilePath: filePath,
         sourceFileContent: query,
         sourceFileDirty: false,
