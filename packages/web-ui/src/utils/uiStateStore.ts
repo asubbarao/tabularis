@@ -59,6 +59,10 @@ export const UI_STATE_KEYS = {
         key: 'tabularis:grid-format-rules',
         parseLegacy: (): undefined => undefined,
     },
+    recentWorkingFiles: {
+        key: 'tabularis:recent-working-files',
+        parseLegacy: (): undefined => undefined,
+    },
     // Expanded explorer tree nodes of every connection (see utils/explorerExpansion).
     // Cached for the first paint so the tree does not open with a visible jump.
     explorerExpanded: {

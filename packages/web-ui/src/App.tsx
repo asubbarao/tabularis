@@ -2,6 +2,7 @@ import {lazy, Suspense, useCallback, useEffect, useMemo, useState} from 'react';
 import {BrowserRouter, Routes, Route, Navigate} from 'react-router-dom';
 import {MainLayout} from './components/layout/MainLayout';
 import {ConnectionLayoutProvider} from './contexts/ConnectionLayoutProvider';
+import {EditorProvider} from '@/contexts/EditorProvider';
 import {RightSidebarProvider} from './contexts/RightSidebarProvider';
 import {KeybindingsProvider} from './contexts/KeybindingsProvider';
 import {PluginSlotProvider} from './contexts/PluginSlotProvider';
@@ -159,70 +160,72 @@ export function App() {
                         <PluginSlotProvider>
                             <PluginModalProvider>
                                 <ConnectionLayoutProvider>
-                                    <RightSidebarProvider>
-                                        <Suspense fallback={<LoadingState />}>
-                                            <Routes>
-                                                <Route
-                                                    path={BROWSER_ROUTES.root}
-                                                    element={<MainLayout />}
-                                                >
+                                    <EditorProvider>
+                                        <RightSidebarProvider>
+                                            <Suspense fallback={<LoadingState />}>
+                                                <Routes>
                                                     <Route
-                                                        index
-                                                        element={
-                                                            <Navigate
-                                                                to={BROWSER_ROUTES.connections}
-                                                                replace
-                                                            />
-                                                        }
+                                                        path={BROWSER_ROUTES.root}
+                                                        element={<MainLayout />}
+                                                    >
+                                                        <Route
+                                                            index
+                                                            element={
+                                                                <Navigate
+                                                                    to={BROWSER_ROUTES.connections}
+                                                                    replace
+                                                                />
+                                                            }
+                                                        />
+                                                        <Route
+                                                            path={BROWSER_ROUTES.connections}
+                                                            element={<Connections />}
+                                                        />
+                                                        <Route
+                                                            path={BROWSER_ROUTES.editor}
+                                                            element={<ConnectionEditorRoute />}
+                                                        />
+                                                        <Route
+                                                            path={BROWSER_ROUTES.connectionEditor}
+                                                            element={<ConnectionEditorRoute />}
+                                                        />
+                                                        <Route
+                                                            path={BROWSER_ROUTES.mcp}
+                                                            element={<McpPage />}
+                                                        />
+                                                        <Route
+                                                            path={BROWSER_ROUTES.settings}
+                                                            element={<Settings />}
+                                                        />
+                                                    </Route>
+                                                    <Route
+                                                        path={BROWSER_ROUTES.schemaDiagram}
+                                                        element={<SchemaDiagramPage />}
                                                     />
                                                     <Route
-                                                        path={BROWSER_ROUTES.connections}
-                                                        element={<Connections />}
+                                                        path={BROWSER_ROUTES.taskManager}
+                                                        element={<TaskManagerPage />}
                                                     />
                                                     <Route
-                                                        path={BROWSER_ROUTES.editor}
-                                                        element={<ConnectionEditorRoute />}
+                                                        path={BROWSER_ROUTES.visualExplain}
+                                                        element={<VisualExplainPage />}
                                                     />
                                                     <Route
-                                                        path={BROWSER_ROUTES.connectionEditor}
-                                                        element={<ConnectionEditorRoute />}
+                                                        path={BROWSER_ROUTES.jsonViewer}
+                                                        element={<JsonViewerPage />}
                                                     />
                                                     <Route
-                                                        path={BROWSER_ROUTES.mcp}
-                                                        element={<McpPage />}
+                                                        path={BROWSER_ROUTES.resultsWindow}
+                                                        element={<ResultsWindowPage />}
                                                     />
                                                     <Route
-                                                        path={BROWSER_ROUTES.settings}
-                                                        element={<Settings />}
+                                                        path={BROWSER_ROUTES.pluginInstall}
+                                                        element={<PluginInstallRoutePage />}
                                                     />
-                                                </Route>
-                                                <Route
-                                                    path={BROWSER_ROUTES.schemaDiagram}
-                                                    element={<SchemaDiagramPage />}
-                                                />
-                                                <Route
-                                                    path={BROWSER_ROUTES.taskManager}
-                                                    element={<TaskManagerPage />}
-                                                />
-                                                <Route
-                                                    path={BROWSER_ROUTES.visualExplain}
-                                                    element={<VisualExplainPage />}
-                                                />
-                                                <Route
-                                                    path={BROWSER_ROUTES.jsonViewer}
-                                                    element={<JsonViewerPage />}
-                                                />
-                                                <Route
-                                                    path={BROWSER_ROUTES.resultsWindow}
-                                                    element={<ResultsWindowPage />}
-                                                />
-                                                <Route
-                                                    path={BROWSER_ROUTES.pluginInstall}
-                                                    element={<PluginInstallRoutePage />}
-                                                />
-                                            </Routes>
-                                        </Suspense>
-                                    </RightSidebarProvider>
+                                                </Routes>
+                                            </Suspense>
+                                        </RightSidebarProvider>
+                                    </EditorProvider>
                                 </ConnectionLayoutProvider>
                             </PluginModalProvider>
                         </PluginSlotProvider>

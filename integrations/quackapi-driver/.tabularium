@@ -1,0 +1,27 @@
+{
+  "id": "quackapi-local",
+  "name": "QuackAPI (local DuckDB)",
+  "kind": "driver",
+  "engine": "duckdb",
+  "paradigms": ["sql"],
+  "version": "0.1.0",
+  "description": "Runs SQL through the existing local QuackAPI service",
+  "default_port": 9495,
+  "executable": "tabularis-quackapi-driver",
+  "capabilities": {
+    "schemas": false,
+    "views": false,
+    "routines": false,
+    "triggers": false,
+    "file_based": false,
+    "connection_string": false,
+    "identifier_quote": "\"",
+    "alter_primary_key": false,
+    "manage_tables": false
+  },
+  "connection_fields": {
+    "database": {"hidden": true}
+  },
+  "sql_dialect": "generic",
+  "data_types": []
+}

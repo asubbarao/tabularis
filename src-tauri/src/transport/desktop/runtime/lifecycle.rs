@@ -8,6 +8,7 @@ pub fn start_desktop_schedulers(app: tauri::AppHandle, ping_interval_secs: u64) 
         .await;
     });
     crate::transport::desktop::ai_approval_watcher::spawn(app.clone());
+    crate::transport::desktop::mcp_file_requests::spawn(app.clone());
     use tauri::Manager;
     crate::database_backup::spawn_database_backup_scheduler(
         app.state::<crate::runtime::RuntimeContext>()

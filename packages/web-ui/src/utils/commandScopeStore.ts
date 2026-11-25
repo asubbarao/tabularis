@@ -16,6 +16,10 @@ export function getActiveCommandScopeId({
     return isSplitRendered && explorerConnectionId ? explorerConnectionId : ROOT_COMMAND_SCOPE_ID;
 }
 
+export function isActiveCommandScope(scopeId: string | undefined, activeScopeId: string): boolean {
+    return (scopeId ?? ROOT_COMMAND_SCOPE_ID) === activeScopeId;
+}
+
 export interface CommandScopeStore {
     getScope: (scopeId: string) => CommandScope | undefined;
     /** Each scope id has exactly one owner: the layout, or a split pane. */

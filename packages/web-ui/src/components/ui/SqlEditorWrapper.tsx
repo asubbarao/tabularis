@@ -50,6 +50,7 @@ interface SqlEditorWrapperProps {
      * A dialect name or the connection's resolved syntax (`resolveSqlSyntax`).
      */
     dialect?: DialectInput;
+    language?: string;
     /** Run the whole editor content (Mod+Shift+Enter). */
     onRunAll?: () => void;
     /**
@@ -124,6 +125,7 @@ const SqlEditorInternal = ({
     height = '100%',
     options,
     dialect,
+    language = 'sql',
     onRunAll,
     onRunContextChange,
     foldPreview = false,
@@ -804,7 +806,7 @@ const SqlEditorInternal = ({
         <MonacoEditor
             // With the indicator, the wrapper below takes the height instead.
             height={cursorStatus ? '100%' : height}
-            defaultLanguage="sql"
+                    defaultLanguage={language}
             theme={getMonacoThemeId(editorTheme.id)}
             defaultValue={initialValue}
             onChange={handleChange}

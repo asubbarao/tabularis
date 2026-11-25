@@ -262,7 +262,7 @@ export const SplitPaneLayout = ({layout, connectionIds}: SplitView) => {
                         {/* Editor */}
                         <div className="flex-1 overflow-hidden min-h-0">
                             <PanelDatabaseProvider connectionId={connId}>
-                                <EditorProvider>
+                                <EditorProvider commandScopeId={connId}>
                                     <Editor commandScopeId={connId} />
                                 </EditorProvider>
                             </PanelDatabaseProvider>

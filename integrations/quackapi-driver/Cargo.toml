@@ -1,0 +1,16 @@
+[package]
+name = "tabularis-quackapi-driver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tabularis-quackapi-driver"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

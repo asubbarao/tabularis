@@ -14,6 +14,21 @@ export interface AddTabOptions {
 
 export interface EditorContextType {
     getAutoRefreshSchedule: (tabId: string) => AutoRefreshSchedule;
+    recentWorkingFiles: string[];
+    openWorkingFile: (
+        path: string,
+        connectionId?: string,
+    ) => Promise<{
+        tabId: string;
+        content: string;
+        connectionId: string;
+        dirty: boolean;
+        sha256?: string;
+    }>;
+    clearRecentWorkingFiles: () => void;
+    waitForMcpOpenRequestListener: () => Promise<void>;
+    waitForMcpRunRequestListener: () => Promise<void>;
+    markMcpRunRequestListenerReady: (ready: boolean) => void;
     tabs: Tab[];
     activeTabId: string | null;
     activeTab: Tab | null;
@@ -56,7 +71,6 @@ export interface EditorContextType {
      * reads the latest state instead of a possibly-stale snapshot.
      */
     updateResultEntry: (tabId: string, entryId: string, partial: Partial<QueryResultEntry>) => void;
-    /** Preview switches do not change MRU history until the selection is committed. */
     setActiveTabId: (id: string, options?: {preview?: boolean}) => void;
     getRecentTabIds: () => string[];
     getSchema: (

@@ -146,6 +146,7 @@ export interface Tab {
     notebookId?: string; // Reference to notebook file in config dir
     notebookState?: NotebookState; // Deprecated: kept for migration of old tabs
     sourceFilePath?: string;
+    sourceFileKind?: 'sql' | 'markdown' | 'text';
     /** Content last read from / written to `sourceFilePath`; dirty = query differs from it. */
     sourceFileContent?: string;
     sourceFileDirty?: boolean;

@@ -65,6 +65,10 @@ export interface EventMap {
     >;
     'tabularis://plugin-activated': EventDefinition<{pluginId: string}, 'database'>;
     'tabularis://plugin-installed': EventDefinition<{slug: string}, 'session'>;
+    'mcp://ui_request': EventDefinition<
+        {id: string; kind: 'open_files' | 'list_visible_tabs'; paths: string[]; responsePath: string},
+        'session'
+    >;
 }
 
 export type EventName = keyof EventMap;
@@ -111,4 +115,5 @@ export const EVENT_AUTHORIZATION = {
     'connection-metadata-invalidated': 'database',
     'tabularis://plugin-activated': 'database',
     'tabularis://plugin-installed': 'session',
+    'mcp://ui_request': 'session',
 } satisfies {[K in EventName]: EventAuthorization<K>};
